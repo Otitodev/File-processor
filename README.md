@@ -1,29 +1,39 @@
 # File-processor — Medical PDF Report Analyzer
 
 Analyzes large scanned PDFs that contain multiple concatenated medical reports.
-Produces a list of every report found, with an AI-generated summary of each one.
+Produces a list of every relevant report found, with an AI-generated summary of each one,
+and exports the results as a formatted Word document.
 
 Handles files of **any size** (thousands of pages) by processing in small batches
 and saving progress after each batch so interrupted runs can be resumed.
+
+Two interfaces are available — a **Streamlit web UI** for interactive use and a
+**CLI** for scripted or automated workflows.
 
 ---
 
 ## How it works
 
 ```
-Large Scanned PDF
-       ↓
-[Page Extraction]     PyMuPDF renders pages as images
-       ↓
-[OCR]                 Tesseract (free, local) or Claude Vision converts images to text
-       ↓
-[Boundary Detection]  Claude identifies where each report starts and ends
-       ↓
-[Report Grouping]     Pages belonging to the same report are collected
-       ↓
-[Summarization]       Claude summarizes each report using your custom prompt
-       ↓
-[Output]              JSON list of reports + summaries
+     ┌──────────────────┐         ┌─────────────────────┐
+     │  CLI  (main.py)  │         │  Web UI  (app.py)   │
+     └────────┬─────────┘         └──────────┬──────────┘
+              └──────────────┬───────────────┘
+                             ↓
+              [Page Extraction]    PyMuPDF renders pages as images
+                             ↓
+              [OCR]               Tesseract (free) or Claude Vision
+                             ↓
+              [Boundary Detection] Claude identifies where each report starts/ends
+                             ↓
+              [Relevance Filter]   Claude drops reports unrelated to the claimant
+                             ↓
+              [Summarization]      Claude summarizes each relevant report
+                             ↓
+             ┌──────────────┴──────────────┐
+             │  JSON file  (CLI)            │
+             │  .docx download  (Web UI)    │
+             └─────────────────────────────┘
 ```
 
 The PDF is never fully loaded into memory. Pages are processed in configurable
@@ -35,7 +45,7 @@ boundaries that fall between chunks are never missed.
 ## Choosing an OCR backend
 
 The biggest cost/quality decision is which OCR engine to use. Two backends are
-supported and selectable with `--ocr-backend`.
+supported and selectable in the web UI or with `--ocr-backend` on the CLI.
 
 ### Backend comparison
 
@@ -45,7 +55,7 @@ supported and selectable with `--ocr-backend`.
 | `claude` | ~$12–24 per 2,000 pages | Best (handles poor scans) | Anthropic API key |
 
 > **Recommendation for 2,000-page files:** Start with Tesseract. OCR cost is $0
-> and you only pay Claude for boundary detection and summarization (~$3–8 total).
+> and you only pay Claude for boundary detection, filtering, and summarization (~$3–8 total).
 > Switch to `--ocr-backend claude` only if Tesseract quality is poor on your scans.
 
 ### Estimated total cost for 2,000 pages
@@ -55,10 +65,10 @@ supported and selectable with `--ocr-backend`.
 | Tesseract (default) | $0 | ~$3–8 | **~$3–8** |
 | Claude Vision (`claude-haiku-4-5`) | ~$24 | ~$3–8 | ~$27–32 |
 
-Claude Vision OCR uses `claude-haiku-4-5` (the cheapest vision-capable model).
-Boundary detection and summarization always use the model set by `--model`
-(default: `claude-sonnet-4-6`). Switch to `claude-haiku-4-5-20251001` via
-`--model` to reduce analysis costs further.
+Claude Vision OCR uses `claude-haiku-4-5` (cheapest vision-capable model).
+Boundary detection, relevance filtering, and summarization use the model set in
+the web UI or via `--model` on the CLI (default: `claude-sonnet-4-6`). Switch to
+`claude-haiku-4-5-20251001` to reduce analysis costs further.
 
 ### Quick decision guide
 
@@ -89,6 +99,9 @@ brew install tesseract               # macOS
 pip install -r requirements.txt
 ```
 
+Dependencies include: `anthropic`, `PyMuPDF`, `pytesseract`, `Pillow`, `click`,
+`tqdm`, `streamlit`, `python-docx`.
+
 ### 3. Set your Anthropic API key
 
 ```bash
@@ -97,7 +110,55 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 ---
 
-## Usage
+## Web UI (Streamlit)
+
+The web UI is the recommended interface for interactive use. No command-line flags
+are needed — everything is configured through a browser form.
+
+### Start the app
+
+```bash
+streamlit run app.py
+```
+
+This opens `http://localhost:8501` in your browser.
+
+### Form fields
+
+| Field | Description |
+|---|---|
+| **Claimant name** | Full name of the claimant. Used in prompts and by the relevance filter to skip unrelated reports. |
+| **Upload PDF file(s)** | One or more scanned PDF disclosure packages. |
+| **Summarization prompt** | The instruction sent to Claude for each report. Pre-filled with a default Ontario auto insurance prompt — edit freely. |
+| **OCR backend** | `tesseract` (free, local) or `claude` (Claude Vision, higher accuracy). |
+| **Claude model** | Model for boundary detection, relevance filtering, and summarization. |
+| **Anthropic API key** | Falls back to the `ANTHROPIC_API_KEY` environment variable if set. |
+
+### Processing and output
+
+Click **Process documents**. A progress bar updates in real time as each file
+moves through OCR → boundary detection → relevance filtering → summarization.
+
+When complete:
+- Each relevant report appears in a collapsible expander showing its title, page range, and summary.
+- A **Download Word document (.docx)** button exports all summaries as a formatted
+  Word file named `<claimant>_medical_summary.docx`.
+
+---
+
+## Relevance filtering
+
+After boundary detection, Claude evaluates each extracted report against the
+claimant's name to decide whether it is relevant to the claim file. Reports that
+are unrelated (e.g., a different patient, administrative pages, blank separators)
+are silently skipped and do not appear in the output or the Word document.
+
+This step is performed automatically. Provide the claimant name in the web UI
+field or via `--claimant-name` on the CLI.
+
+---
+
+## CLI
 
 ```bash
 python main.py <PDF_FILE> --prompt "<your summarization prompt>"
@@ -111,6 +172,13 @@ python main.py patient_records.pdf \
   --prompt "Summarize this medical report: include patient name, date, type of report, key findings, and any recommended follow-up."
 ```
 
+**With relevance filtering:**
+```bash
+python main.py patient_records.pdf \
+  --prompt "Summarize this medical report." \
+  --claimant-name "Jane Smith"
+```
+
 **High-accuracy OCR** (better for poor-quality scans, uses Claude Vision):
 ```bash
 python main.py patient_records.pdf \
@@ -118,7 +186,7 @@ python main.py patient_records.pdf \
   --ocr-backend claude
 ```
 
-**Cheaper analysis model** (reduces Claude API cost for boundary detection and summarization):
+**Cheaper analysis model** (reduces Claude API cost):
 ```bash
 python main.py patient_records.pdf \
   --prompt "Summarize this medical report." \
@@ -139,6 +207,8 @@ start fresh.
 ---
 
 ## Output
+
+### JSON (CLI)
 
 Results are saved to `results.json` (configurable with `--output`):
 
@@ -161,20 +231,29 @@ Results are saved to `results.json` (configurable with `--output`):
 ]
 ```
 
+Only relevant reports are included (those that passed the relevance filter).
+
+### Word document (Web UI)
+
+The `.docx` file contains:
+- **Title block** — "Medical-Legal Summary", claimant name, and generation date
+- **One section per report** — report title as a heading, page range, and full summary text
+
 ---
 
-## Options
+## CLI Options
 
 | Option | Default | Description |
 |---|---|---|
 | `--prompt` / `-p` | *(required)* | Summarization prompt applied to each report |
+| `--claimant-name` | *(empty)* | Claimant's full name; injected into prompts and used by the relevance filter |
 | `--api-key` / `-k` | `$ANTHROPIC_API_KEY` | Anthropic API key |
 | `--output` / `-o` | `results.json` | Output file path |
 | `--batch-size` / `-b` | `30` | Pages per batch (lower = less RAM) |
 | `--overlap` | `2` | Overlap pages between batches (prevents missing boundaries) |
 | `--dpi` | `200` | Rendering DPI for OCR (200 is a good default) |
 | `--ocr-backend` | `tesseract` | `tesseract` (free, local) or `claude` (higher accuracy, uses image tokens) |
-| `--model` | `claude-sonnet-4-6` | Claude model for boundary detection and summarization |
+| `--model` | `claude-sonnet-4-6` | Claude model for boundary detection, filtering, and summarization |
 | `--progress-file` | `.pipeline_progress.json` | Checkpoint file for resuming |
 
 ---
@@ -183,12 +262,14 @@ Results are saved to `results.json` (configurable with `--output`):
 
 ```
 File-processor/
+├── app.py               # Streamlit web UI entry point
 ├── main.py              # CLI entry point
 ├── requirements.txt
 └── src/
     ├── __init__.py
     ├── extractor.py        # PDF → page images (PyMuPDF)
     ├── ocr_engine.py       # Page images → text (Tesseract or Claude Vision)
-    ├── report_analyzer.py  # Boundary detection + summarization (Claude)
-    └── pipeline.py         # Orchestrates the full pipeline with checkpointing
+    ├── report_analyzer.py  # Boundary detection, relevance filtering, summarization (Claude)
+    ├── docx_writer.py      # ReportSummary list → formatted .docx bytes
+    └── pipeline.py         # Orchestrates full pipeline with checkpointing
 ```
