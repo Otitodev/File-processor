@@ -132,6 +132,75 @@ def detect_boundaries(
 
 
 # ---------------------------------------------------------------------------
+# Relevance classification
+# ---------------------------------------------------------------------------
+
+_RELEVANCE_SYSTEM = """\
+You are reviewing detected medical documents for an Ontario auto insurance personal injury
+claim file. Determine whether this document is RELEVANT for inclusion in a medicolegal
+claim file summary.
+
+RELEVANT — include these document types:
+- Insurer's examinations / independent medical examinations (IME)
+- OCF-18 Treatment and Assessment Plans
+- Occupational therapy assessments and reports
+- Physiotherapy assessments and reports
+- Psychology or psychiatry assessments and reports
+- Specialist medical opinions (orthopaedic, neurology, physiatry, pain medicine, etc.)
+- Disability Certificates (OCF-3)
+- Functional capacity evaluations
+- Neuropsychological assessments
+- Catastrophic impairment assessments
+
+NOT RELEVANT — exclude these document types:
+- Hospital admission or discharge summaries and nursing notes
+- Pharmacy records or medication lists
+- Basic lab results or diagnostic imaging readings (X-ray, MRI, CT) without specialist
+  interpretation
+- General family physician clinical or office notes
+- Administrative records and correspondence
+
+Return ONLY a JSON object with no markdown fences:
+{"relevant": true, "reason": "brief explanation"}
+"""
+
+
+def classify_relevance(
+    report: ReportBoundary,
+    claimant_name: str,
+    client: anthropic.Anthropic,
+    model: str = "claude-sonnet-4-6",
+) -> bool:
+    """
+    Return True if this report should be included in the medicolegal summary.
+
+    Only the first 3 000 characters of the report text are sent to keep token
+    usage low — the document type is usually apparent from the header alone.
+    Returns True (include) if the Claude response cannot be parsed.
+    """
+    snippet = report.text[:3_000]
+    user_msg = (
+        f"Claimant: {claimant_name or 'Unknown'}\n"
+        f"Detected document title: {report.title}\n\n"
+        f"--- DOCUMENT TEXT (first portion) ---\n{snippet}"
+    )
+    response = client.messages.create(
+        model=model,
+        max_tokens=256,
+        system=_RELEVANCE_SYSTEM,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    raw = response.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        result = json.loads(raw)
+        return bool(result.get("relevant", True))
+    except json.JSONDecodeError:
+        return True  # include by default if parsing fails
+
+
+# ---------------------------------------------------------------------------
 # Summarization
 # ---------------------------------------------------------------------------
 

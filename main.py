@@ -96,6 +96,11 @@ from src.pipeline import process_pdf
     show_default=True,
     help="Checkpoint file. Delete this file to start fresh instead of resuming.",
 )
+@click.option(
+    "--claimant-name", "-n",
+    default="",
+    help="Claimant's full name. Injected into prompts for context and relevance filtering.",
+)
 def main(
     pdf_path,
     prompt,
@@ -107,6 +112,7 @@ def main(
     ocr_backend,
     model,
     progress_file,
+    claimant_name,
 ):
     """
     Analyze a large scanned PDF containing multiple medical reports.
@@ -135,6 +141,7 @@ def main(
         dpi=dpi,
         ocr_backend=ocr_backend,
         analysis_model=model,
+        claimant_name=claimant_name,
     )
 
     click.echo(f"\n{'=' * 60}")
