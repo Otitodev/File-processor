@@ -6,23 +6,24 @@ Processes a large scanned PDF in chunks:
   2. OCR the images to text.
   3. Detect report boundaries within the batch.
   4. Accumulate partial reports across batch boundaries.
-  5. Summarize each completed report.
-  6. Save progress to a JSON file after every batch so the run can be resumed.
+  5. Filter out documents that are not relevant to the medicolegal claim file.
+  6. Summarize each completed, relevant report.
+  7. Save progress to a JSON file after every batch so the run can be resumed.
 """
 
 import json
 import os
 from dataclasses import asdict
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import anthropic
-from tqdm import tqdm
 
 from .extractor import get_page_count, iter_page_batches
 from .ocr_engine import OCRBackend, ocr_batch
 from .report_analyzer import (
     ReportBoundary,
     ReportSummary,
+    classify_relevance,
     detect_boundaries,
     summarize_report,
 )
@@ -51,13 +52,15 @@ def process_pdf(
     dpi: int = 200,
     ocr_backend: OCRBackend = "tesseract",
     analysis_model: str = "claude-sonnet-4-6",
+    claimant_name: str = "",
+    on_progress: Optional[Callable[[float, str], None]] = None,
 ) -> List[ReportSummary]:
     """
     Full pipeline: PDF → list of summarized reports.
 
     Args:
         pdf_path:        Path to the input PDF.
-        summary_prompt:  Your custom prompt for how to summarize each report.
+        summary_prompt:  Custom prompt for how to summarize each report.
         api_key:         Anthropic API key.
         output_path:     Where to write the final JSON results.
         progress_file:   Checkpoint file for resuming interrupted runs.
@@ -66,10 +69,21 @@ def process_pdf(
         dpi:             Page rendering resolution for OCR.
         ocr_backend:     "tesseract" (local) or "claude" (vision API, more accurate).
         analysis_model:  Claude model for boundary detection and summarization.
+        claimant_name:   Claimant's full name — injected into prompts for context and
+                         used by the relevance filter.
+        on_progress:     Optional callback(fraction, message) called at each pipeline
+                         stage. fraction is 0.0–1.0. Falls back to print() when None.
 
     Returns:
-        List of ReportSummary objects.
+        List of ReportSummary objects for relevant documents only.
     """
+
+    def _log(fraction: float, message: str) -> None:
+        if on_progress is not None:
+            on_progress(fraction, message)
+        else:
+            print(message)
+
     client = anthropic.Anthropic(api_key=api_key)
     total_pages = get_page_count(pdf_path)
     state = _load_progress(progress_file)
@@ -84,116 +98,107 @@ def process_pdf(
     last_completed_page: int = state.get("last_completed_page", 0)
     report_counter = len(summaries)
 
-    print(f"PDF has {total_pages} pages. Resuming from page {last_completed_page + 1}.")
+    # Prepend the claimant name to the summary prompt so Claude has full context
+    effective_prompt = summary_prompt
+    if claimant_name:
+        effective_prompt = f"Claimant: {claimant_name}\n\n{summary_prompt}"
 
-    batch_iter = iter_page_batches(pdf_path, batch_size=batch_size, dpi=dpi, overlap=overlap)
+    _log(0.0, f"PDF has {total_pages} pages. Resuming from page {last_completed_page + 1}.")
 
-    with tqdm(total=total_pages, initial=last_completed_page, unit="page", desc="Processing") as pbar:
-        for batch_start, batch_end, images in batch_iter:
-            # Skip batches we've already processed (resume support)
-            if batch_end <= last_completed_page:
-                continue
-
-            # ------------------------------------------------------------------
-            # Step 1: OCR
-            # ------------------------------------------------------------------
-            page_texts = ocr_batch(images, backend=ocr_backend, client=client)
-
-            # ------------------------------------------------------------------
-            # Step 2: Detect report boundaries in this batch
-            # ------------------------------------------------------------------
-            boundaries = detect_boundaries(
-                page_texts=page_texts,
-                batch_start_page=batch_start,
+    def _finalize(boundary: ReportBoundary, fraction: float) -> None:
+        """Classify relevance and, if relevant, summarize a complete report."""
+        nonlocal report_counter
+        if classify_relevance(boundary, claimant_name, client, analysis_model):
+            summary = summarize_report(
+                report=boundary,
+                summary_prompt=effective_prompt,
                 client=client,
                 model=analysis_model,
             )
+            report_counter += 1
+            summary.report_index = report_counter
+            summaries.append(summary)
+            _log(fraction, f"Summarized: {summary.title}")
+        else:
+            _log(fraction, f"Skipped (not relevant): {boundary.title}")
 
-            # ------------------------------------------------------------------
-            # Step 3: Merge with any pending report from the previous batch
-            # ------------------------------------------------------------------
-            if boundaries:
-                first = boundaries[0]
+    batch_iter = iter_page_batches(pdf_path, batch_size=batch_size, dpi=dpi, overlap=overlap)
 
-                if pending_boundary is not None:
-                    if first.start_page <= last_completed_page + overlap:
-                        # The first detection is a continuation of the pending report
-                        pending_boundary.text += "\n\n" + first.text
-                        if first.end_page is not None:
-                            # The pending report is now complete — summarize it
-                            pending_boundary.end_page = first.end_page
-                            summary = summarize_report(
-                                report=pending_boundary,
-                                summary_prompt=summary_prompt,
-                                client=client,
-                                model=analysis_model,
-                            )
-                            report_counter += 1
-                            summary.report_index = report_counter
-                            summaries.append(summary)
-                            pending_boundary = None
-                        # Process remaining boundaries normally
-                        remaining = boundaries[1:]
-                    else:
-                        # The pending report ended before this batch — close it
-                        pending_boundary.end_page = batch_start - 1
-                        summary = summarize_report(
-                            report=pending_boundary,
-                            summary_prompt=summary_prompt,
-                            client=client,
-                            model=analysis_model,
-                        )
-                        report_counter += 1
-                        summary.report_index = report_counter
-                        summaries.append(summary)
+    for batch_start, batch_end, images in batch_iter:
+        # Skip batches we've already processed (resume support)
+        if batch_end <= last_completed_page:
+            continue
+
+        fraction = batch_end / total_pages
+
+        # ------------------------------------------------------------------
+        # Step 1: OCR
+        # ------------------------------------------------------------------
+        _log(fraction, f"OCR: pages {batch_start}–{batch_end} of {total_pages}")
+        page_texts = ocr_batch(images, backend=ocr_backend, client=client)
+
+        # ------------------------------------------------------------------
+        # Step 2: Detect report boundaries in this batch
+        # ------------------------------------------------------------------
+        _log(fraction, f"Detecting boundaries in pages {batch_start}–{batch_end}…")
+        boundaries = detect_boundaries(
+            page_texts=page_texts,
+            batch_start_page=batch_start,
+            client=client,
+            model=analysis_model,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 3: Merge with any pending report from the previous batch
+        # ------------------------------------------------------------------
+        if boundaries:
+            first = boundaries[0]
+
+            if pending_boundary is not None:
+                if first.start_page <= last_completed_page + overlap:
+                    # The first detection is a continuation of the pending report
+                    pending_boundary.text += "\n\n" + first.text
+                    if first.end_page is not None:
+                        # The pending report is now complete — finalize it
+                        pending_boundary.end_page = first.end_page
+                        _finalize(pending_boundary, fraction)
                         pending_boundary = None
-                        remaining = boundaries
+                    # Process remaining boundaries normally
+                    remaining = boundaries[1:]
                 else:
+                    # The pending report ended before this batch — close it
+                    pending_boundary.end_page = batch_start - 1
+                    _finalize(pending_boundary, fraction)
+                    pending_boundary = None
                     remaining = boundaries
+            else:
+                remaining = boundaries
 
-                # Summarize all fully-bounded reports; hold the last open one
-                for boundary in remaining:
-                    if boundary.end_page is not None:
-                        summary = summarize_report(
-                            report=boundary,
-                            summary_prompt=summary_prompt,
-                            client=client,
-                            model=analysis_model,
-                        )
-                        report_counter += 1
-                        summary.report_index = report_counter
-                        summaries.append(summary)
-                    else:
-                        # This report continues into the next batch
-                        pending_boundary = boundary
+            # Finalize all fully-bounded reports; hold the last open one
+            for boundary in remaining:
+                if boundary.end_page is not None:
+                    _finalize(boundary, fraction)
+                else:
+                    # This report continues into the next batch
+                    pending_boundary = boundary
 
-            # ------------------------------------------------------------------
-            # Step 4: Save progress checkpoint
-            # ------------------------------------------------------------------
-            last_completed_page = batch_end
-            state = {
-                "last_completed_page": last_completed_page,
-                "summaries": [asdict(s) for s in summaries],
-                "pending_report": asdict(pending_boundary) if pending_boundary else None,
-            }
-            _save_progress(progress_file, state)
-
-            pbar.update(batch_end - (batch_start - (overlap if batch_start > 1 else 0)))
+        # ------------------------------------------------------------------
+        # Step 4: Save progress checkpoint
+        # ------------------------------------------------------------------
+        last_completed_page = batch_end
+        state = {
+            "last_completed_page": last_completed_page,
+            "summaries": [asdict(s) for s in summaries],
+            "pending_report": asdict(pending_boundary) if pending_boundary else None,
+        }
+        _save_progress(progress_file, state)
 
     # ------------------------------------------------------------------
     # Step 5: Close any report still open at the very end of the PDF
     # ------------------------------------------------------------------
     if pending_boundary is not None:
         pending_boundary.end_page = total_pages
-        summary = summarize_report(
-            report=pending_boundary,
-            summary_prompt=summary_prompt,
-            client=client,
-            model=analysis_model,
-        )
-        report_counter += 1
-        summary.report_index = report_counter
-        summaries.append(summary)
+        _finalize(pending_boundary, 1.0)
 
     # ------------------------------------------------------------------
     # Step 6: Write final output
@@ -206,5 +211,5 @@ def process_pdf(
     if os.path.exists(progress_file):
         os.remove(progress_file)
 
-    print(f"\nDone. Found {len(summaries)} report(s). Results saved to: {output_path}")
+    _log(1.0, f"Done. Found {len(summaries)} relevant report(s). Results saved to: {output_path}")
     return summaries
