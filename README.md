@@ -64,16 +64,16 @@ python main.py <PDF_FILE> --prompt "<your summarization prompt>"
 
 ### Examples
 
-**Basic usage:**
+**Basic usage (Ontario auto insurance disclosure package):**
 ```bash
-python main.py patient_records.pdf \
-  --prompt "Summarize this medical report: include patient name, date, type of report, key findings, and any recommended follow-up."
+python main.py disclosure_package.pdf \
+  --prompt "Summarize this medical document for use in an Ontario auto insurance claim file."
 ```
 
 **High-accuracy OCR** (better for poor-quality scans, uses Claude Vision):
 ```bash
-python main.py patient_records.pdf \
-  --prompt "Extract: patient name, date of report, diagnosis, and treatment plan." \
+python main.py disclosure_package.pdf \
+  --prompt "Summarize this medical document for use in an Ontario auto insurance claim file." \
   --ocr-backend claude
 ```
 
@@ -98,20 +98,28 @@ Results are saved to `results.json` (configurable with `--output`):
 [
   {
     "report_index": 1,
-    "title": "Chest X-Ray — John Smith",
+    "title": "INSURER'S EXAMINATION – MEDICAL PHYSICIAN ASSESSMENT — Dr. Mohamed Khaled",
     "start_page": 1,
-    "end_page": 3,
-    "summary": "Patient John Smith, DOB 1965-04-12. Chest X-ray performed 2024-01-15. ..."
+    "end_page": 4,
+    "summary": "Dr. Mohamed Khaled, Physician, completed an INSURER'S EXAMINATION – MEDICAL PHYSICIAN ASSESSMENT dated December 30, 2025, opining that the claimant sustained significant accident-related spinal injuries, including a comminuted burst fracture of the T12 vertebral body with central canal stenosis and a cervical vertebral fracture requiring surgical intervention. Dr. Khaled documented ongoing axial spinal pain aggravated by activity and prolonged positioning, the use of a four-wheel walker and back brace for ambulation, and structural range of motion impairments with functional impairment related to muscular deconditioning and cervical and/or lumbar sprain/strain. Dr. Khaled identified no pre-accident conditions from a physical medicine perspective.\n\nWith respect to the disputed OCF-18 dated October 24, 2025, in the amount of $2,200.00, Dr. Khaled opined that the proposed goods and services were reasonable and necessary as a direct result of the accident-related injuries. The plan included assessment services totaling $2,200.00, consisting of a total body assessment and documentation support activity."
   },
   {
     "report_index": 2,
-    "title": "Blood Panel — Jane Doe",
-    "start_page": 4,
-    "end_page": 6,
-    "summary": "..."
+    "title": "OCF-18 Treatment and Assessment Plan — Laura Nelson",
+    "start_page": 5,
+    "end_page": 7,
+    "summary": "Laura Nelson, Occupational Therapist (College Registration Number G1911702), completed an OCF-18 Treatment and Assessment Plan (Effective date 2016-10-01) dated September 9, 2025, proposing occupational therapy services totaling $3,940.04. The proposed services included therapy for motor and living skills, provider travel time, documentation support activity, and brokerage/service fees. The document reflects approval of the amount of $3,940.04."
   }
 ]
 ```
+
+Each `summary` is written as professional prose paragraph(s) suitable for an insurance claim file. The format covers:
+
+- **Author identification**: name, credential, and registration number where present
+- **Document type and date**: exact document title and date
+- **Clinical findings**: injuries, diagnoses, functional limitations, and equipment/aids documented
+- **Treatment plans (OCF-18)**: proposed services, dollar amounts, and approval status
+- **Disability certificates (OCF-3)**: listed injuries and functional inability statements
 
 ---
 

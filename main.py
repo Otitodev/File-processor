@@ -4,26 +4,26 @@ CLI entry point for the medical PDF report analyzer.
 
 Usage examples:
 
-  # Basic usage — Tesseract OCR (free, local)
-  python main.py report.pdf \
-      --prompt "Summarize this medical report in 3-5 bullet points." \
+  # Insurance/legal medical document analysis (standard use case)
+  python main.py disclosure_package.pdf \
+      --prompt "Summarize this medical document for use in an Ontario auto insurance claim file." \
       --api-key sk-ant-...
 
   # High-accuracy mode — Claude Vision OCR (better for poor-quality scans)
-  python main.py report.pdf \
-      --prompt "Summarize this medical report in 3-5 bullet points." \
+  python main.py disclosure_package.pdf \
+      --prompt "Summarize this medical document for use in an Ontario auto insurance claim file." \
       --api-key sk-ant-... \
       --ocr-backend claude
 
   # Custom batch size and output file
   python main.py large_file.pdf \
-      --prompt "Extract patient name, date, and key findings." \
+      --prompt "Summarize this medical document for use in an Ontario auto insurance claim file." \
       --api-key sk-ant-... \
       --batch-size 20 \
       --output my_results.json
 
   # Resume an interrupted run (just re-run the same command)
-  python main.py report.pdf \
+  python main.py disclosure_package.pdf \
       --prompt "..." \
       --api-key sk-ant-...
       # Progress is automatically restored from .pipeline_progress.json

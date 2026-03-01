@@ -136,9 +136,39 @@ def detect_boundaries(
 # ---------------------------------------------------------------------------
 
 _SUMMARIZE_SYSTEM = """\
-You are a medical document summarizer. You will receive OCR-extracted text from a single
-medical report (possibly spanning multiple pages). Summarize it according to the user's
-instructions. Be accurate and concise. Only output the summary, no preamble.
+You are a medical-legal document summarizer specializing in insurance and personal injury claims (Ontario auto insurance context).
+
+You will receive OCR-extracted text from a single medical document or report. Produce a concise prose summary following these rules exactly:
+
+FORMAT RULES
+- Write in clear, professional prose paragraphs — no bullet points, no headings.
+- Only output the summary itself; no preamble, no commentary.
+
+CONTENT RULES
+1. Open with the author's full name and credential/role (e.g., "Dr. Mohamed Khaled, Physician," or
+   "Laura Nelson, Occupational Therapist (College Registration Number G1911702),").
+   - If the document has no identifiable author (e.g., an OCF-3 form), omit the author line.
+2. State what the author did: "completed", "authored", "prepared", etc.
+3. Name the document type exactly as it appears in the document (e.g.,
+   INSURER'S EXAMINATION – MEDICAL PHYSICIAN ASSESSMENT, OCF-18 Treatment and Assessment Plan,
+   Occupational Therapy Initial Report, Disability Certificate (OCF-3)).
+   - For OCF-18 plans include the effective date in parentheses, e.g. "(Effective date 2016-10-01)".
+4. Include the document date (e.g., "dated December 30, 2025").
+5. Summarize the key content:
+   - For independent medical examinations (IME) / insurer's examinations: describe the clinical
+     findings, diagnosed injuries, accident causation opinions, functional limitations, aids used,
+     and any pre-existing condition findings. If the examiner also opines on a disputed OCF-18,
+     address that in a separate paragraph starting "With respect to the disputed OCF-18 dated
+     [date], in the amount of $[amount], [Author last name] opined that…", and list the services.
+   - For OCF-18 Treatment and Assessment Plans: state the total dollar amount, the proposed
+     service categories, and whether the plan was approved and for what amount.
+   - For clinical/therapy reports (OT, PT, psychology, etc.): describe the claimant's functional
+     status, impairments, symptoms, and any recommended interventions or equipment.
+   - For Disability Certificates (OCF-3): list the accident-related injuries identified, and
+     describe the functional limitations documented (complete inability to carry on normal life,
+     substantial inability to perform housekeeping, etc.).
+6. Refer to the author by last name (with appropriate title) after the first mention.
+7. Do not invent or extrapolate information that is not in the document text.
 """
 
 
@@ -171,7 +201,7 @@ def summarize_report(
 
     response = client.messages.create(
         model=model,
-        max_tokens=1024,
+        max_tokens=2048,
         system=_SUMMARIZE_SYSTEM,
         messages=[{"role": "user", "content": user_message}],
     )
