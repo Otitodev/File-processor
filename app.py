@@ -146,28 +146,31 @@ with st.expander("Cloudflare R2 storage (optional — recommended for large file
         "so you can re-run without re-uploading."
     )
 
-    r2_secrets = st.secrets.get("r2", {}) if hasattr(st, "secrets") else {}
+    try:
+        r2_secrets = st.secrets.get("r2", {})
+    except Exception:
+        r2_secrets = {}
 
     r2_account_id = st.text_input(
         "R2 Account ID",
-        value=r2_secrets.get("account_id", ""),
+        value=r2_secrets.get("account_id", "") or os.environ.get("R2_ACCOUNT_ID", ""),
         help="Found in the Cloudflare dashboard → R2 → Manage R2 API tokens.",
     )
     r2_col1, r2_col2 = st.columns(2)
     with r2_col1:
         r2_access_key = st.text_input(
             "R2 Access Key ID",
-            value=r2_secrets.get("access_key_id", ""),
+            value=r2_secrets.get("access_key_id", "") or os.environ.get("R2_ACCESS_KEY_ID", ""),
         )
     with r2_col2:
         r2_secret_key = st.text_input(
             "R2 Secret Access Key",
             type="password",
-            value=r2_secrets.get("secret_access_key", ""),
+            value=r2_secrets.get("secret_access_key", "") or os.environ.get("R2_SECRET_ACCESS_KEY", ""),
         )
     r2_bucket = st.text_input(
         "R2 Bucket name",
-        value=r2_secrets.get("bucket_name", ""),
+        value=r2_secrets.get("bucket_name", "") or os.environ.get("R2_BUCKET_NAME", ""),
     )
     delete_after_processing = st.checkbox(
         "Delete from R2 after processing",

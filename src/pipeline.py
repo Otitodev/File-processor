@@ -54,6 +54,7 @@ def process_pdf(
     analysis_model: str = "claude-sonnet-4-6",
     claimant_name: str = "",
     on_progress: Optional[Callable[[float, str], None]] = None,
+    on_skipped: Optional[Callable[[str, str, int, int], None]] = None,
 ) -> List[ReportSummary]:
     """
     Full pipeline: PDF → list of summarized reports.
@@ -73,6 +74,9 @@ def process_pdf(
                          used by the relevance filter.
         on_progress:     Optional callback(fraction, message) called at each pipeline
                          stage. fraction is 0.0–1.0. Falls back to print() when None.
+        on_skipped:      Optional callback(reason, title, start_page, end_page) fired
+                         whenever a detected report is not summarized. reason is one of:
+                         "no_text" | "not_relevant" | "duplicate".
 
     Returns:
         List of ReportSummary objects for relevant documents only.
