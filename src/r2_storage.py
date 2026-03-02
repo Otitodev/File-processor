@@ -84,3 +84,48 @@ def list_uploads(client, bucket: str, prefix: str = "uploads/") -> List[Dict[str
                 }
             )
     return items
+
+
+def generate_presigned_post(
+    client,
+    bucket: str,
+    object_key: str,
+    expires_in: int = 3600,
+) -> dict:
+    """
+    Generate a presigned POST URL + form fields for a direct browser-to-R2 upload.
+
+    The browser POSTs a multipart/form-data request directly to R2,
+    bypassing any intermediate server (e.g. Railway's reverse proxy).
+
+    Returns:
+        dict with "url" (str) and "fields" (dict of form fields that must be
+        submitted alongside the file, with "file" appended last per S3 spec).
+    """
+    return client.generate_presigned_post(
+        Bucket=bucket,
+        Key=object_key,
+        Fields={"Content-Type": "application/pdf"},
+        Conditions=[
+            {"Content-Type": "application/pdf"},
+            ["content-length-range", 1, 2 * 1024 * 1024 * 1024],  # 2 GB max
+        ],
+        ExpiresIn=expires_in,
+    )
+
+
+def object_exists(client, bucket: str, object_key: str) -> bool:
+    """Return True if the given object exists in R2 (uses HeadObject, no data transfer)."""
+    from botocore.exceptions import ClientError
+    try:
+        client.head_object(Bucket=bucket, Key=object_key)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+            return False
+        raise
+
+
+def get_object_size(client, bucket: str, object_key: str) -> int:
+    """Return the ContentLength in bytes of an existing R2 object."""
+    return client.head_object(Bucket=bucket, Key=object_key)["ContentLength"]
