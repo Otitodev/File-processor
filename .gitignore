@@ -15,7 +15,17 @@ env/
 results.json
 
 # Streamlit
-.streamlit/
+.streamlit/secrets.toml
+
+# Secrets
+.env
+src/.env
 
 # OS
 .DS_Store
+
+# files
+*.pdf
+*.docx
+reports.db
+CLAUDE.md

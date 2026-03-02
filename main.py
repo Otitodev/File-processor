@@ -131,7 +131,7 @@ def main(
         sys.exit(1)
 
     summaries = process_pdf(
-        pdf_path=pdf_path,
+        pdf_source=pdf_path,
         summary_prompt=prompt,
         api_key=api_key,
         output_path=output,

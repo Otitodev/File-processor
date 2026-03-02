@@ -14,7 +14,7 @@ Processes a large scanned PDF in chunks:
 import json
 import os
 from dataclasses import asdict
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 import anthropic
 
@@ -42,7 +42,7 @@ def _save_progress(progress_file: str, state: dict) -> None:
 
 
 def process_pdf(
-    pdf_path: str,
+    pdf_source: Union[str, bytes],
     summary_prompt: str,
     api_key: str,
     output_path: str = "results.json",
@@ -59,7 +59,7 @@ def process_pdf(
     Full pipeline: PDF → list of summarized reports.
 
     Args:
-        pdf_path:        Path to the input PDF.
+        pdf_source:      Path to the input PDF, or raw PDF bytes (e.g. downloaded from R2).
         summary_prompt:  Custom prompt for how to summarize each report.
         api_key:         Anthropic API key.
         output_path:     Where to write the final JSON results.
@@ -85,7 +85,7 @@ def process_pdf(
             print(message)
 
     client = anthropic.Anthropic(api_key=api_key)
-    total_pages = get_page_count(pdf_path)
+    total_pages = get_page_count(pdf_source)
     state = _load_progress(progress_file)
 
     summaries: List[ReportSummary] = [
@@ -105,9 +105,22 @@ def process_pdf(
 
     _log(0.0, f"PDF has {total_pages} pages. Resuming from page {last_completed_page + 1}.")
 
+    # Track finalized start pages to prevent duplicates from the overlap zone.
+    # Seed from restored summaries so a resumed run doesn't re-finalize them.
+    finalized_start_pages: set = {s.start_page for s in summaries}
+
     def _finalize(boundary: ReportBoundary, fraction: float) -> None:
         """Classify relevance and, if relevant, summarize a complete report."""
         nonlocal report_counter
+        # Skip reports with no usable OCR text — avoids "I don't see any report text" responses
+        if len(boundary.text.strip()) < 50:
+            _log(fraction, f"Skipped (no text): {boundary.title}")
+            return
+        # Skip if this start page was already finalized (overlap duplicate)
+        if boundary.start_page in finalized_start_pages:
+            _log(fraction, f"Skipped (duplicate at page {boundary.start_page}): {boundary.title}")
+            return
+        finalized_start_pages.add(boundary.start_page)
         if classify_relevance(boundary, claimant_name, client, analysis_model):
             summary = summarize_report(
                 report=boundary,
@@ -122,7 +135,7 @@ def process_pdf(
         else:
             _log(fraction, f"Skipped (not relevant): {boundary.title}")
 
-    batch_iter = iter_page_batches(pdf_path, batch_size=batch_size, dpi=dpi, overlap=overlap)
+    batch_iter = iter_page_batches(pdf_source, batch_size=batch_size, dpi=dpi, overlap=overlap)
 
     for batch_start, batch_end, images in batch_iter:
         # Skip batches we've already processed (resume support)

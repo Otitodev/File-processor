@@ -6,21 +6,28 @@ Supports very large PDFs by yielding one page at a time.
 import fitz  # PyMuPDF
 from PIL import Image
 import io
-from typing import Generator, Tuple
+from typing import Generator, Tuple, Union
 
 
-def iter_pages(pdf_path: str, dpi: int = 200) -> Generator[Tuple[int, Image.Image], None, None]:
+def _open_doc(pdf_source: Union[str, bytes]) -> fitz.Document:
+    """Open a PDF from a file path or raw bytes."""
+    if isinstance(pdf_source, bytes):
+        return fitz.open(stream=pdf_source, filetype="pdf")
+    return fitz.open(pdf_source)
+
+
+def iter_pages(pdf_source: Union[str, bytes], dpi: int = 200) -> Generator[Tuple[int, Image.Image], None, None]:
     """
     Yield (page_number, PIL.Image) for every page in the PDF.
 
     Args:
-        pdf_path: Path to the PDF file.
+        pdf_source: Path to the PDF file, or raw PDF bytes.
         dpi: Rendering resolution. 200 dpi is good for OCR; lower saves memory.
 
     Yields:
         (1-based page number, PIL Image in RGB mode)
     """
-    doc = fitz.open(pdf_path)
+    doc = _open_doc(pdf_source)
     try:
         mat = fitz.Matrix(dpi / 72, dpi / 72)  # 72 is PyMuPDF's base DPI
         for page_num in range(len(doc)):
@@ -32,16 +39,16 @@ def iter_pages(pdf_path: str, dpi: int = 200) -> Generator[Tuple[int, Image.Imag
         doc.close()
 
 
-def get_page_count(pdf_path: str) -> int:
+def get_page_count(pdf_source: Union[str, bytes]) -> int:
     """Return the total number of pages without loading all of them."""
-    doc = fitz.open(pdf_path)
+    doc = _open_doc(pdf_source)
     count = len(doc)
     doc.close()
     return count
 
 
 def iter_page_batches(
-    pdf_path: str,
+    pdf_source: Union[str, bytes],
     batch_size: int = 30,
     dpi: int = 200,
     overlap: int = 2,
@@ -53,7 +60,7 @@ def iter_page_batches(
     batch so that report boundaries falling between batches are not missed.
 
     Args:
-        pdf_path:   Path to the PDF.
+        pdf_source: Path to the PDF, or raw PDF bytes.
         batch_size: Number of pages per batch.
         dpi:        Rendering DPI.
         overlap:    Pages to repeat between batches for boundary continuity.
@@ -61,7 +68,7 @@ def iter_page_batches(
     Yields:
         (start_page, end_page, list_of_images)  — page numbers are 1-based.
     """
-    doc = fitz.open(pdf_path)
+    doc = _open_doc(pdf_source)
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     total = len(doc)
 

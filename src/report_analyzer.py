@@ -6,10 +6,40 @@ Report analyzer — uses Claude to:
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import anthropic
+
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+_MAX_RETRIES = 5
+_RETRY_BASE_DELAY = 10  # seconds; doubles each attempt (10, 20, 40, 80, 160)
+
+
+def _create_with_retry(client: anthropic.Anthropic, **kwargs):
+    """
+    Call client.messages.create with exponential backoff on rate-limit and
+    overload errors. Re-raises immediately on any other error type.
+    """
+    delay = _RETRY_BASE_DELAY
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except anthropic.RateLimitError:
+            if attempt == _MAX_RETRIES:
+                raise
+            time.sleep(delay)
+            delay *= 2
+        except anthropic.APIStatusError as e:
+            if e.status_code == 529 and attempt < _MAX_RETRIES:  # API overloaded
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -87,7 +117,8 @@ def detect_boundaries(
         abs_page = batch_start_page + i
         pages_block += f"\n\n--- PAGE {abs_page} ---\n{text.strip()}"
 
-    response = client.messages.create(
+    response = _create_with_retry(
+        client,
         model=model,
         max_tokens=2048,
         system=_BOUNDARY_SYSTEM,
@@ -165,17 +196,21 @@ Return ONLY a JSON object with no markdown fences:
 """
 
 
+_RELEVANCE_MODEL = "claude-haiku-4-5-20251001"  # yes/no decision — no need for Sonnet
+
+
 def classify_relevance(
     report: ReportBoundary,
     claimant_name: str,
     client: anthropic.Anthropic,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-sonnet-4-6",  # kept for signature compat; ignored internally
 ) -> bool:
     """
     Return True if this report should be included in the medicolegal summary.
 
-    Only the first 3 000 characters of the report text are sent to keep token
-    usage low — the document type is usually apparent from the header alone.
+    Always uses Haiku — the task is a simple yes/no classification that does not
+    need a larger model. Only the first 3 000 characters of the report text are
+    sent; the document type is usually apparent from the header alone.
     Returns True (include) if the Claude response cannot be parsed.
     """
     snippet = report.text[:3_000]
@@ -184,8 +219,9 @@ def classify_relevance(
         f"Detected document title: {report.title}\n\n"
         f"--- DOCUMENT TEXT (first portion) ---\n{snippet}"
     )
-    response = client.messages.create(
-        model=model,
+    response = _create_with_retry(
+        client,
+        model=_RELEVANCE_MODEL,
         max_tokens=256,
         system=_RELEVANCE_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
@@ -268,7 +304,8 @@ def summarize_report(
 
     user_message = f"{summary_prompt}\n\n--- REPORT TEXT ---\n{text}"
 
-    response = client.messages.create(
+    response = _create_with_retry(
+        client,
         model=model,
         max_tokens=2048,
         system=_SUMMARIZE_SYSTEM,

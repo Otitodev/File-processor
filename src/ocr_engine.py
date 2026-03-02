@@ -14,6 +14,8 @@ from typing import List, Literal
 
 from PIL import Image
 
+from .report_analyzer import _create_with_retry
+
 OCRBackend = Literal["tesseract", "claude"]
 
 
@@ -39,7 +41,8 @@ def ocr_page_tesseract(img: Image.Image) -> str:
 def ocr_page_claude(img: Image.Image, client) -> str:
     """Extract text from a single page image using Claude Vision."""
     b64 = _image_to_b64(img)
-    response = client.messages.create(
+    response = _create_with_retry(
+        client,
         model="claude-haiku-4-5-20251001",  # cheapest vision-capable model
         max_tokens=4096,
         messages=[
