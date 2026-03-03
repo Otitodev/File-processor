@@ -82,7 +82,7 @@ Your task: identify where each medical report starts and ends within this batch.
 Return a JSON array (no markdown, raw JSON only) with one object per report found:
 [
   {
-    "title": "<report type or patient name if visible>",
+    "title": "<descriptive title combining: facility/company name if shown + report type + author/assessor name with credential + date, e.g. 'CanAssess Insurer\u2019s Examination \u2013 Psychiatry Assessment \u2013 Dr. Susan MacKenzie dated December 24, 2025'; do NOT include the patient or claimant name>",
     "type": "<one of: IME | OT Assessment | PT Assessment | Psychology | Psychiatry | Disability Certificate | OCF-1 | OCF-19 | OCF-18 | FCE | Ambulance Report | Hospital Record | Consultation Note | Other>",
     "start_page": <the absolute page number from the --- PAGE N --- label where this report begins>,
     "end_page": <the absolute page number from the --- PAGE N --- label where this report ends, or null if it continues past the last page shown>
@@ -93,6 +93,8 @@ Rules:
 - A new report typically begins with a header (patient name, date, report type, facility name, etc.)
 - If the batch starts mid-report, use start_page equal to the first --- PAGE N --- label shown.
 - If a report ends after the last page in the batch, set end_page to null.
+- For "title", use: [facility/company name — ] report type — author/assessor name with credential — "dated" document date.
+  Leave out any component that is not visible in the document. Never put the patient or claimant name in the title.
 - For "type", choose the best match from the allowed values. Use "Other" if none fit.
 - Do NOT output anything except the JSON array.
 """
@@ -210,6 +212,8 @@ NOT RELEVANT — exclude these document types:
 - Instructions for assessor / instructions to examiner (letters briefing an IME assessor
   on what to evaluate — administrative, no clinical findings)
 - Cover letters and transmittal letters accompanying reports (administrative only)
+- Assessment information / referral packages (administrative packages sent to an assessor
+  before an examination — no clinical findings)
 
 Return ONLY a JSON object with no markdown fences:
 {"relevant": true, "reason": "brief explanation"}
