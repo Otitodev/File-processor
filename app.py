@@ -4,15 +4,23 @@ Streamlit web UI for the Medical Document Analyzer.
 Run with:
     streamlit run app.py
 
-R2 storage is optional. When R2 credentials are provided (via UI or
-.streamlit/secrets.toml), uploaded PDFs are stored in Cloudflare R2 and
-processed from there — no temp files on disk. Without R2 credentials, the
-uploaded file bytes are passed directly to the pipeline (no temp files either).
+All credentials are read from environment variables — never shown in the UI:
+    ANTHROPIC_API_KEY     — required
+    R2_ENABLED            — set to "true" to enable Cloudflare R2 storage
+    R2_ACCOUNT_ID         — Cloudflare account ID
+    R2_ACCESS_KEY_ID      — R2 API token access key
+    R2_SECRET_ACCESS_KEY  — R2 API token secret key
+    R2_BUCKET_NAME        — R2 bucket name
+
+When R2_ENABLED=true, large PDFs are uploaded directly from the browser to R2
+via a presigned PUT URL, bypassing the Railway reverse proxy entirely.
+Without R2, uploaded file bytes are passed directly to the pipeline in memory.
 """
 
 import io
 import json
 import os
+import uuid as _uuid
 
 import anthropic
 import streamlit as st
@@ -20,9 +28,34 @@ import streamlit as st
 from src.pipeline import process_pdf
 from src.report_analyzer import ReportSummary
 from src.docx_writer import generate_word_document
-from src.db import init_db, save_run, list_runs, get_run_summaries, delete_run
+from src.db import (
+    init_db, save_run, list_runs, get_run_summaries, delete_run,
+    list_sessions, get_session_summaries, delete_session,
+    save_prompt, list_prompts, delete_prompt,
+    get_setting, set_setting,
+)
 
 init_db()
+
+# ---------------------------------------------------------------------------
+# Credentials — read from environment, never shown in UI
+# ---------------------------------------------------------------------------
+
+_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def _env_or_db(env_key: str, db_key: str) -> str:
+    return os.environ.get(env_key) or get_setting(db_key)
+
+
+_r2_enabled = os.environ.get("R2_ENABLED", "").lower() in ("1", "true", "yes") \
+              or get_setting("r2_enabled") == "true"
+_r2_account = _env_or_db("R2_ACCOUNT_ID",       "r2_account_id")
+_r2_access  = _env_or_db("R2_ACCESS_KEY_ID",     "r2_access_key_id")
+_r2_secret  = _env_or_db("R2_SECRET_ACCESS_KEY", "r2_secret_access_key")
+_r2_bucket  = _env_or_db("R2_BUCKET_NAME",       "r2_bucket_name")
+
+r2_configured = _r2_enabled and bool(_r2_account and _r2_access and _r2_secret and _r2_bucket)
 
 
 def _recover_partial_summaries(progress_file: str, offset: int) -> list:
@@ -43,6 +76,132 @@ def _recover_partial_summaries(progress_file: str, offset: int) -> list:
         return recovered
     except Exception:
         return []
+
+
+def _get_r2_client():
+    from src.r2_storage import R2Config, get_client
+    return get_client(R2Config(
+        account_id=_r2_account,
+        access_key_id=_r2_access,
+        secret_access_key=_r2_secret,
+        bucket_name=_r2_bucket,
+    ))
+
+
+def _render_r2_upload_widget(put_url: str, filename: str) -> None:
+    """
+    Render an HTML/JS upload widget that PUTs a file directly to R2
+    using a presigned PUT URL. No data passes through Railway's proxy.
+    """
+    import json as _json
+
+    url_json = _json.dumps(put_url)
+    hint     = _json.dumps(filename)
+
+    widget_html = f"""
+<style>
+  #r2box {{
+    font-family: sans-serif;
+    padding: 12px 14px;
+    border: 1px solid #d0d0d0;
+    border-radius: 6px;
+    background: #fafafa;
+  }}
+  #r2box label {{ display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; color: #333; }}
+  #r2-file   {{ display: block; margin-bottom: 10px; }}
+  #r2-btn    {{ background: #1f6aa5; color: #fff; border: none; border-radius: 4px;
+                padding: 7px 18px; font-size: 14px; cursor: pointer; }}
+  #r2-btn:disabled {{ background: #888; cursor: not-allowed; }}
+  #r2-prog-wrap {{ display: none; margin-top: 10px; }}
+  #r2-bar-bg  {{ background: #e0e0e0; border-radius: 5px; height: 22px;
+                 position: relative; overflow: hidden; }}
+  #r2-bar-fill {{ background: #1f6aa5; height: 100%; width: 0%;
+                  border-radius: 5px; transition: width 0.15s ease; }}
+  #r2-pct     {{ position: absolute; top: 50%; left: 50%;
+                 transform: translate(-50%, -50%);
+                 font-size: 12px; font-weight: 700; color: #fff;
+                 text-shadow: 0 0 3px rgba(0,0,0,0.4); pointer-events: none; }}
+  #r2-status {{ margin-top: 6px; font-size: 13px; min-height: 18px; }}
+</style>
+<div id="r2box">
+  <label>Upload PDF directly to R2 (large files supported)</label>
+  <input type="file" id="r2-file" accept=".pdf" />
+  <button id="r2-btn" onclick="doUpload()">Upload to R2</button>
+  <div id="r2-prog-wrap">
+    <div id="r2-bar-bg">
+      <div id="r2-bar-fill"></div>
+      <span id="r2-pct">0%</span>
+    </div>
+  </div>
+  <div id="r2-status">Select the file <b>{filename}</b> then click Upload.</div>
+</div>
+<script>
+const PUT_URL = {url_json};
+const HINT    = {hint};
+
+function doUpload() {{
+  const inp      = document.getElementById('r2-file');
+  const stat     = document.getElementById('r2-status');
+  const progWrap = document.getElementById('r2-prog-wrap');
+  const barFill  = document.getElementById('r2-bar-fill');
+  const pctLabel = document.getElementById('r2-pct');
+  const btn      = document.getElementById('r2-btn');
+
+  if (!inp.files || !inp.files.length) {{
+    stat.style.color = '#c00';
+    stat.textContent = 'Please select a PDF file first.';
+    return;
+  }}
+
+  const file = inp.files[0];
+
+  btn.disabled = true;
+  progWrap.style.display = 'block';
+  barFill.style.width = '0%';
+  pctLabel.textContent = '0%';
+  stat.style.color = '#333';
+  stat.textContent = 'Uploading\u2026';
+
+  const xhr = new XMLHttpRequest();
+
+  xhr.upload.addEventListener('progress', e => {{
+    if (e.lengthComputable) {{
+      const pct = Math.round(e.loaded / e.total * 100);
+      barFill.style.width = pct + '%';
+      pctLabel.textContent = pct + '%';
+      stat.textContent = (e.loaded / 1048576).toFixed(1) + ' MB / '
+        + (e.total / 1048576).toFixed(1) + ' MB';
+    }}
+  }});
+
+  xhr.addEventListener('load', () => {{
+    btn.disabled = false;
+    progWrap.style.display = 'none';
+    if (xhr.status >= 200 && xhr.status < 300) {{
+      stat.style.color = '#1a7a1a';
+      stat.textContent = '\u2713 Upload complete! Click \u201cConfirm upload\u201d below.';
+    }} else {{
+      stat.style.color = '#c00';
+      stat.textContent = 'Upload failed (HTTP ' + xhr.status + '). '
+        + xhr.responseText.substring(0, 200);
+    }}
+  }});
+
+  xhr.addEventListener('error', () => {{
+    btn.disabled = false;
+    progWrap.style.display = 'none';
+    stat.style.color = '#c00';
+    stat.textContent = 'Network error. Check R2 CORS policy allows PUT from this origin.';
+  }});
+
+  xhr.open('PUT', PUT_URL);
+  xhr.setRequestHeader('Content-Type', 'application/pdf');
+  xhr.send(file);
+}}
+</script>
+"""
+    st.components.v1.html(widget_html, height=200, scrolling=False)
+
 
 # ---------------------------------------------------------------------------
 # Default summarization prompt
@@ -76,6 +235,13 @@ if "r2_files" not in st.session_state:
     # List of dicts: {object_key, filename, size_bytes}
     st.session_state["r2_files"] = []
 
+if "pending_upload" not in st.session_state:
+    # Holds presigned POST state between Streamlit reruns while user uploads
+    st.session_state["pending_upload"] = None
+
+if "summary_prompt" not in st.session_state:
+    st.session_state["summary_prompt"] = _DEFAULT_PROMPT
+
 # ---------------------------------------------------------------------------
 # Input form
 # ---------------------------------------------------------------------------
@@ -88,24 +254,58 @@ claimant_name = st.text_input(
     help="Used to identify the claimant in every prompt sent to Claude.",
 )
 
-uploaded_files = st.file_uploader(
-    "Upload PDF file(s)",
-    type=["pdf"],
-    accept_multiple_files=True,
-    help="You may upload one or more scanned PDF disclosure packages.",
-)
+# When R2 is enabled, the file uploader is replaced by the presigned POST flow
+# below (the native uploader would fail for large files via Railway's proxy).
+if not r2_configured:
+    uploaded_files = st.file_uploader(
+        "Upload PDF file(s)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="You may upload one or more scanned PDF disclosure packages.",
+    )
+else:
+    uploaded_files = []   # not used in the R2 path
 
 st.subheader("Summarization Prompt")
 
+# --- Load a saved prompt ---
+_saved_prompts = list_prompts()
+if _saved_prompts:
+    with st.expander(f"Saved prompts ({len(_saved_prompts)})"):
+        for _sp in _saved_prompts:
+            _col_name, _col_load, _col_del = st.columns([5, 1, 1])
+            _col_name.write(_sp["name"])
+            if _col_load.button("Load", key=f"load_prompt_{_sp['id']}"):
+                st.session_state["summary_prompt"] = _sp["text"]
+                st.rerun()
+            if _col_del.button("🗑", key=f"del_prompt_{_sp['id']}", help="Delete this prompt"):
+                delete_prompt(_sp["id"])
+                st.rerun()
+
+# --- Edit area (key keeps value in sync with session state) ---
 summary_prompt = st.text_area(
     "Prompt sent to Claude for each relevant report",
-    value=_DEFAULT_PROMPT,
-    height=120,
+    key="summary_prompt",
+    height=250,
     help=(
         "Edit this prompt to change how each report is summarized. "
         "The claimant's name is automatically prepended."
     ),
 )
+
+# --- Save current prompt ---
+_col_pname, _col_psave = st.columns([4, 1])
+with _col_pname:
+    _prompt_save_name = st.text_input(
+        "Save prompt as",
+        placeholder="e.g. Standard auto insurance",
+        label_visibility="collapsed",
+    )
+with _col_psave:
+    if st.button("Save prompt", disabled=not _prompt_save_name.strip()):
+        save_prompt(_prompt_save_name.strip(), summary_prompt)
+        st.success(f'Saved "{_prompt_save_name.strip()}"')
+        st.rerun()
 
 st.subheader("Settings")
 
@@ -128,97 +328,111 @@ with col2:
         help="Model used for boundary detection, relevance filtering, and summarization.",
     )
 
-api_key = st.text_input(
-    "Anthropic API key",
-    type="password",
-    value=os.environ.get("ANTHROPIC_API_KEY", ""),
-    help="Falls back to the ANTHROPIC_API_KEY environment variable if set.",
-)
-
-# ---------------------------------------------------------------------------
-# R2 configuration (optional)
-# ---------------------------------------------------------------------------
-
-with st.expander("Cloudflare R2 storage (optional — recommended for large files)"):
-    st.caption(
-        "When configured, PDFs are uploaded to R2 and processed from there — "
-        "no temp files on the server. Files are kept in R2 after processing "
-        "so you can re-run without re-uploading."
-    )
-
-    try:
-        r2_secrets = st.secrets.get("r2", {})
-    except Exception:
-        r2_secrets = {}
-
-    r2_account_id = st.text_input(
-        "R2 Account ID",
-        value=r2_secrets.get("account_id", "") or os.environ.get("R2_ACCOUNT_ID", ""),
-        help="Found in the Cloudflare dashboard → R2 → Manage R2 API tokens.",
-    )
-    r2_col1, r2_col2 = st.columns(2)
-    with r2_col1:
-        r2_access_key = st.text_input(
-            "R2 Access Key ID",
-            value=r2_secrets.get("access_key_id", "") or os.environ.get("R2_ACCESS_KEY_ID", ""),
+# Show setup only when R2 is not yet working (credentials missing)
+if not r2_configured:
+    with st.expander("⚠️ File upload not configured — set up R2 storage"):
+        st.markdown(
+            "Large PDFs fail to upload through Railway's proxy. "
+            "Direct-to-R2 upload bypasses it entirely. "
+            "**Free tier is enough** (10 GB storage, unlimited egress).\n\n"
+            "**Get credentials in ~2 minutes:**\n"
+            "1. [cloudflare.com/r2](https://dash.cloudflare.com/) → R2 → Create bucket\n"
+            "2. Manage R2 API Tokens → Create Token (Object Read & Write on that bucket)\n"
+            "3. Copy Account ID, Access Key ID, Secret Access Key, and bucket name below."
         )
-    with r2_col2:
-        r2_secret_key = st.text_input(
-            "R2 Secret Access Key",
-            type="password",
-            value=r2_secrets.get("secret_access_key", "") or os.environ.get("R2_SECRET_ACCESS_KEY", ""),
-        )
-    r2_bucket = st.text_input(
-        "R2 Bucket name",
-        value=r2_secrets.get("bucket_name", "") or os.environ.get("R2_BUCKET_NAME", ""),
-    )
-    delete_after_processing = st.checkbox(
-        "Delete from R2 after processing",
-        value=False,
-        help="If unchecked, files stay in R2 — useful for re-running without re-uploading.",
-    )
+        with st.form("r2_setup_form"):
+            _acct   = st.text_input("Account ID",        value=get_setting("r2_account_id"))
+            _access = st.text_input("Access Key ID",     value=get_setting("r2_access_key_id"))
+            _secret = st.text_input("Secret Access Key", value=get_setting("r2_secret_access_key"), type="password")
+            _bucket = st.text_input("Bucket name",       value=get_setting("r2_bucket_name"))
+            _col_save, _col_clear = st.columns([2, 1])
+            _submitted = _col_save.form_submit_button("Save & activate", type="primary")
+            _cleared   = _col_clear.form_submit_button("Clear credentials")
 
-r2_configured = bool(r2_account_id and r2_access_key and r2_secret_key and r2_bucket)
+        if _submitted:
+            if _acct and _access and _secret and _bucket:
+                set_setting("r2_enabled",          "true")
+                set_setting("r2_account_id",        _acct)
+                set_setting("r2_access_key_id",     _access)
+                set_setting("r2_secret_access_key", _secret)
+                set_setting("r2_bucket_name",       _bucket)
+                st.success("R2 credentials saved — reloading…")
+                st.rerun()
+            else:
+                st.error("Fill in all four fields.")
 
-
-def _get_r2_client():
-    from src.r2_storage import R2Config, get_client
-    cfg = R2Config(
-        account_id=r2_account_id,
-        access_key_id=r2_access_key,
-        secret_access_key=r2_secret_key,
-        bucket_name=r2_bucket,
-    )
-    return get_client(cfg)
-
+        if _cleared:
+            for _k in ("r2_enabled", "r2_account_id", "r2_access_key_id",
+                       "r2_secret_access_key", "r2_bucket_name"):
+                set_setting(_k, "")
+            st.info("Credentials cleared — reloading…")
+            st.rerun()
 
 # ---------------------------------------------------------------------------
-# Upload files to R2 (when R2 is configured)
+# R2 direct upload (when R2_ENABLED=true)
 # ---------------------------------------------------------------------------
 
-if r2_configured and uploaded_files:
-    from src.r2_storage import make_object_key, upload_fileobj
+if r2_configured:
+    from src.r2_storage import make_object_key, generate_presigned_put
 
-    already_staged = {f["filename"] for f in st.session_state["r2_files"]}
-    new_files = [f for f in uploaded_files if f.name not in already_staged]
+    st.subheader("Upload file to R2")
 
-    if new_files:
-        client = _get_r2_client()
-        for uf in new_files:
-            with st.spinner(f"Uploading {uf.name} to R2…"):
+    if not claimant_name.strip():
+        st.info("Enter the claimant's name above before uploading files.")
+    else:
+        pdf_filename = st.text_input(
+            "PDF filename",
+            placeholder="e.g. Ashok_Kapoor_Med_File.pdf",
+            help="Type the filename of the PDF you are about to upload.",
+        ).strip()
+
+        if pdf_filename:
+            pending = st.session_state["pending_upload"]
+
+            # Generate (or reuse) presigned POST — only regenerate when
+            # filename or claimant name changes to avoid flickering on reruns.
+            needs_new = (
+                pending is None
+                or pending["filename"] != pdf_filename
+                or pending["claimant_name"] != claimant_name.strip()
+            )
+            if needs_new:
+                client = _get_r2_client()
+                object_key = make_object_key(claimant_name.strip(), pdf_filename)
+                put_url = generate_presigned_put(client, _r2_bucket, object_key)
+                st.session_state["pending_upload"] = {
+                    "filename":      pdf_filename,
+                    "object_key":    object_key,
+                    "put_url":       put_url,
+                    "claimant_name": claimant_name.strip(),
+                }
+                pending = st.session_state["pending_upload"]
+
+            _render_r2_upload_widget(pending["put_url"], pdf_filename)
+
+            if st.button("✓ Confirm upload", key="r2_confirm"):
+                from src.r2_storage import object_exists, get_object_size
+                client = _get_r2_client()
+                obj_key = pending["object_key"]
                 try:
-                    key = make_object_key(claimant_name, uf.name)
-                    upload_fileobj(client, r2_bucket, io.BytesIO(uf.read()), key)
-                    st.session_state["r2_files"].append(
-                        {"object_key": key, "filename": uf.name, "size_bytes": uf.size}
-                    )
+                    if object_exists(client, _r2_bucket, obj_key):
+                        size_bytes = get_object_size(client, _r2_bucket, obj_key)
+                        already_staged = {f["object_key"] for f in st.session_state["r2_files"]}
+                        if obj_key not in already_staged:
+                            st.session_state["r2_files"].append({
+                                "object_key": obj_key,
+                                "filename":   pending["filename"],
+                                "size_bytes": size_bytes,
+                            })
+                        st.session_state["pending_upload"] = None
+                        st.rerun()
+                    else:
+                        st.error(
+                            "File not found in R2 yet. Use the Upload button above to "
+                            "upload the file first, then click Confirm."
+                        )
                 except Exception as e:
-                    st.error(f"Failed to upload **{uf.name}** to R2: {e}")
-        uploaded_count = sum(
-            1 for f in st.session_state["r2_files"] if f["filename"] not in already_staged
-        )
-        if uploaded_count:
-            st.success(f"Uploaded {uploaded_count} file(s) to R2.")
+                    st.error(f"Could not verify upload: {e}")
 
 # ---------------------------------------------------------------------------
 # Manage R2 files
@@ -235,7 +449,7 @@ if r2_configured and st.session_state["r2_files"]:
             from src.r2_storage import delete_object
             try:
                 client = _get_r2_client()
-                delete_object(client, r2_bucket, r2f["object_key"])
+                delete_object(client, _r2_bucket, r2f["object_key"])
                 to_remove.append(i)
             except Exception as e:
                 st.error(f"Could not delete **{r2f['filename']}** from R2: {e}")
@@ -248,7 +462,6 @@ if r2_configured and st.session_state["r2_files"]:
 # Determine files to process
 # ---------------------------------------------------------------------------
 
-# When R2 is configured, process what's in R2. Otherwise use the uploader directly.
 files_ready_for_processing = (
     len(st.session_state["r2_files"]) > 0
     if r2_configured
@@ -263,41 +476,40 @@ ready = bool(
     claimant_name.strip()
     and files_ready_for_processing
     and summary_prompt.strip()
-    and api_key.strip()
+    and _api_key
 )
 
 if not claimant_name.strip():
     st.info("Enter the claimant's name to continue.")
 elif not files_ready_for_processing:
     st.info("Upload at least one PDF file to continue.")
-elif not api_key.strip():
-    st.warning("An Anthropic API key is required.")
+elif not _api_key:
+    st.warning("ANTHROPIC_API_KEY environment variable is not set.")
 
 # ---------------------------------------------------------------------------
 # Past runs history
 # ---------------------------------------------------------------------------
 
-_past_runs = list_runs()
-if _past_runs:
-    with st.expander(f"Past runs ({len(_past_runs)})"):
-        for run in _past_runs:
+_past_sessions = list_sessions()
+if _past_sessions:
+    with st.expander(f"Past runs ({len(_past_sessions)})"):
+        for session in _past_sessions:
             col_claimant, col_file, col_date, col_count, col_dl, col_del = st.columns(
                 [2, 2, 2, 1, 1, 1]
             )
-            col_claimant.write(run["claimant"])
-            col_file.write(run["filename"])
-            # Show only the date portion of the ISO timestamp
-            col_date.write(run["created_at"][:10])
-            col_count.write(str(run["report_count"]))
+            col_claimant.write(session["claimant"])
+            col_file.write(session["filenames"])
+            col_date.write(session["created_at"][:16].replace("T", " ") + " UTC")
+            col_count.write(str(session["report_count"]))
 
-            dl_label = f"dl_{run['id']}"
-            del_label = f"del_{run['id']}"
+            sid       = session["session_id"]
+            dl_label  = f"dl_{sid}"
+            del_label = f"del_{sid}"
 
-            # Download button — regenerates Word doc from DB on the fly
             try:
-                run_summaries = get_run_summaries(run["id"])
-                docx_bytes = generate_word_document(run["claimant"], run_summaries)
-                safe = run["claimant"].replace(" ", "_")
+                session_summaries = get_session_summaries(sid)
+                docx_bytes        = generate_word_document(session["claimant"], session_summaries)
+                safe              = session["claimant"].replace(" ", "_")
                 col_dl.download_button(
                     label="⬇",
                     data=docx_bytes,
@@ -306,13 +518,12 @@ if _past_runs:
                     key=dl_label,
                     help="Download Word document",
                 )
-            except Exception as e:
+            except Exception:
                 col_dl.write("—")
 
-            # Delete button
             if col_del.button("🗑", key=del_label, help="Delete this run"):
                 try:
-                    delete_run(run["id"])
+                    delete_session(sid)
                 except Exception as e:
                     st.error(f"Could not delete run: {e}")
                 st.rerun()
@@ -323,9 +534,22 @@ if _past_runs:
 
 if st.button("Process documents", disabled=not ready, type="primary"):
     all_summaries = []
+    skipped_reports = []   # list of dicts: {reason, title, start_page, end_page, file}
+    session_id = _uuid.uuid4().hex
+
+    def make_skip_callback(f_label):
+        def _on_skipped(reason, title, start_page, end_page):
+            skipped_reports.append({
+                "reason":     reason,
+                "title":      title,
+                "start_page": start_page,
+                "end_page":   end_page,
+                "file":       f_label,
+            })
+        return _on_skipped
 
     if r2_configured:
-        from src.r2_storage import download_as_bytes, delete_object as r2_delete
+        from src.r2_storage import download_as_bytes
         work_items = [
             (r2f["filename"], r2f["object_key"], r2f)
             for r2f in st.session_state["r2_files"]
@@ -338,7 +562,7 @@ if st.button("Process documents", disabled=not ready, type="primary"):
 
     total_files = len(work_items)
     overall_bar = st.progress(0, text="Starting…")
-    status_box = st.empty()
+    status_box  = st.empty()
 
     for file_idx, (file_label, source_ref, r2f_meta) in enumerate(work_items):
         progress_file = f".pipeline_progress_{file_idx}.json"
@@ -357,31 +581,29 @@ if st.button("Process documents", disabled=not ready, type="primary"):
                 return _on_progress
 
             if r2_configured:
-                # Download from R2 into memory — no temp file on disk
                 try:
                     client_r2 = _get_r2_client()
                     with st.spinner(f"Downloading {file_label} from R2…"):
-                        pdf_source = download_as_bytes(client_r2, r2_bucket, source_ref)
+                        pdf_source = download_as_bytes(client_r2, _r2_bucket, source_ref)
                 except Exception as e:
                     st.error(f"Failed to download **{file_label}** from R2: {e}")
                     continue
             else:
-                # Read uploaded bytes directly — no temp file needed
                 pdf_source = source_ref.read()
 
             file_summaries = process_pdf(
                 pdf_source=pdf_source,
                 summary_prompt=summary_prompt,
-                api_key=api_key,
+                api_key=_api_key,
                 output_path=os.devnull,
                 progress_file=progress_file,
                 ocr_backend=ocr_backend,
                 analysis_model=analysis_model,
                 claimant_name=claimant_name.strip(),
                 on_progress=make_progress_callback(file_idx, file_label, total_files),
+                on_skipped=make_skip_callback(file_label),
             )
 
-            # Offset indices so they're globally sequential across all files
             offset = len(all_summaries)
             for s in file_summaries:
                 s.report_index = offset + s.report_index
@@ -392,31 +614,17 @@ if st.button("Process documents", disabled=not ready, type="primary"):
                 f"**{file_label}** — done. {new_count} relevant report(s) found."
             )
 
-            # Persist to SQLite so results survive page refreshes
             if file_summaries:
                 try:
-                    save_run(claimant_name.strip(), file_label, file_summaries)
+                    save_run(claimant_name.strip(), file_label, file_summaries, session_id=session_id)
                 except Exception as e:
                     st.warning(f"Could not save results to database: {e}")
 
-            # Optionally delete from R2 after successful processing
-            if r2_configured and delete_after_processing and r2f_meta is not None:
-                try:
-                    r2_delete(client_r2, r2_bucket, r2f_meta["object_key"])
-                    st.session_state["r2_files"] = [
-                        f for f in st.session_state["r2_files"]
-                        if f["object_key"] != r2f_meta["object_key"]
-                    ]
-                except Exception as e:
-                    st.warning(
-                        f"Could not delete **{file_label}** from R2 after processing: {e}"
-                    )
-
         except anthropic.AuthenticationError:
             st.error(
-                "Invalid Anthropic API key — check the key in the Settings section and try again."
+                "Invalid Anthropic API key — check the ANTHROPIC_API_KEY environment variable."
             )
-            break  # all subsequent files will fail with the same key
+            break
 
         except anthropic.RateLimitError:
             partial = _recover_partial_summaries(progress_file, len(all_summaries))
@@ -452,15 +660,7 @@ if st.button("Process documents", disabled=not ready, type="primary"):
                 + (f" — recovered {len(partial)} report(s) so far." if partial else "")
             )
 
-        # Note: no finally cleanup here. pipeline.py deletes the progress file on
-        # success. On error (rate limit, auth, etc.) we deliberately keep it so
-        # that clicking "Process documents" again resumes from the last checkpoint.
-
     overall_bar.progress(1.0, text="Done.")
-
-    # -----------------------------------------------------------------------
-    # Results — shown even if some files failed
-    # -----------------------------------------------------------------------
 
     if not all_summaries:
         st.warning(
@@ -470,18 +670,28 @@ if st.button("Process documents", disabled=not ready, type="primary"):
     else:
         st.success(f"Found **{len(all_summaries)}** relevant report(s).")
 
+        if skipped_reports:
+            with st.expander(f"Skipped / filtered reports ({len(skipped_reports)})"):
+                for sk in skipped_reports:
+                    reason_label = {
+                        "not_relevant": "Not relevant",
+                        "no_text":      "No OCR text",
+                        "duplicate":    "Duplicate",
+                    }.get(sk["reason"], sk["reason"])
+                    st.write(
+                        f"**{reason_label}** — {sk['title']} "
+                        f"(pages {sk['start_page']}–{sk['end_page']}, file: {sk['file']})"
+                    )
+
         st.subheader("Summaries")
         for s in all_summaries:
             with st.expander(f"[{s.report_index}] {s.title}  (pages {s.start_page}–{s.end_page})"):
                 st.write(s.summary)
 
-        # -------------------------------------------------------------------
-        # Word document download
-        # -------------------------------------------------------------------
         st.subheader("Download")
 
         docx_bytes = generate_word_document(claimant_name.strip(), all_summaries)
-        safe_name = claimant_name.strip().replace(" ", "_")
+        safe_name  = claimant_name.strip().replace(" ", "_")
         st.download_button(
             label="Download Word document (.docx)",
             data=docx_bytes,

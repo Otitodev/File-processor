@@ -119,10 +119,14 @@ def process_pdf(
         # Skip reports with no usable OCR text — avoids "I don't see any report text" responses
         if len(boundary.text.strip()) < 50:
             _log(fraction, f"Skipped (no text): {boundary.title}")
+            if on_skipped is not None:
+                on_skipped("no_text", boundary.title, boundary.start_page, boundary.end_page)
             return
         # Skip if this start page was already finalized (overlap duplicate)
         if boundary.start_page in finalized_start_pages:
             _log(fraction, f"Skipped (duplicate at page {boundary.start_page}): {boundary.title}")
+            if on_skipped is not None:
+                on_skipped("duplicate", boundary.title, boundary.start_page, boundary.end_page)
             return
         finalized_start_pages.add(boundary.start_page)
         if classify_relevance(boundary, claimant_name, client, analysis_model):
@@ -138,6 +142,8 @@ def process_pdf(
             _log(fraction, f"Summarized: {summary.title}")
         else:
             _log(fraction, f"Skipped (not relevant): {boundary.title}")
+            if on_skipped is not None:
+                on_skipped("not_relevant", boundary.title, boundary.start_page, boundary.end_page)
 
     batch_iter = iter_page_batches(pdf_source, batch_size=batch_size, dpi=dpi, overlap=overlap)
 

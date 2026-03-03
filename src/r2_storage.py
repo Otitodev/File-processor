@@ -84,3 +84,43 @@ def list_uploads(client, bucket: str, prefix: str = "uploads/") -> List[Dict[str
                 }
             )
     return items
+
+
+def generate_presigned_put(
+    client,
+    bucket: str,
+    object_key: str,
+    expires_in: int = 3600,
+) -> str:
+    """
+    Generate a presigned PUT URL for a direct browser-to-R2 upload.
+
+    The browser PUTs the raw file bytes to this URL with Content-Type=application/pdf.
+    No form fields are needed. Returns the URL string.
+    """
+    return client.generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": bucket,
+            "Key": object_key,
+            "ContentType": "application/pdf",
+        },
+        ExpiresIn=expires_in,
+    )
+
+
+def object_exists(client, bucket: str, object_key: str) -> bool:
+    """Return True if the given object exists in R2 (uses HeadObject, no data transfer)."""
+    from botocore.exceptions import ClientError
+    try:
+        client.head_object(Bucket=bucket, Key=object_key)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+            return False
+        raise
+
+
+def get_object_size(client, bucket: str, object_key: str) -> int:
+    """Return the ContentLength in bytes of an existing R2 object."""
+    return client.head_object(Bucket=bucket, Key=object_key)["ContentLength"]
