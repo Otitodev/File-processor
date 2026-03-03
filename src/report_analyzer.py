@@ -80,14 +80,14 @@ Return a JSON array (no markdown, raw JSON only) with one object per report foun
 [
   {
     "title": "<report type or patient name if visible>",
-    "start_page": <1-based page number within this batch>,
-    "end_page": <1-based page number, or null if the report continues beyond this batch>
+    "start_page": <the absolute page number from the --- PAGE N --- label where this report begins>,
+    "end_page": <the absolute page number from the --- PAGE N --- label where this report ends, or null if it continues past the last page shown>
   }
 ]
 
 Rules:
 - A new report typically begins with a header (patient name, date, report type, facility name, etc.)
-- If the batch starts mid-report, use start_page = 1.
+- If the batch starts mid-report, use start_page equal to the first --- PAGE N --- label shown.
 - If a report ends after the last page in the batch, set end_page to null.
 - Do NOT output anything except the JSON array.
 """
@@ -139,16 +139,20 @@ def detect_boundaries(
 
     results = []
     for b in boundaries:
-        # Relative page numbers from Claude → absolute page numbers
-        rel_start = b.get("start_page", 1)
-        rel_end = b.get("end_page")
+        # Claude returns absolute page numbers matching the --- PAGE N --- labels
+        abs_start = b.get("start_page", batch_start_page)
+        abs_end = b.get("end_page")   # already absolute; None means "open"
 
-        abs_start = batch_start_page + rel_start - 1
-        abs_end = (batch_start_page + rel_end - 1) if rel_end is not None else None
+        # Convert absolute page numbers to 0-based list indices
+        text_start_idx = abs_start - batch_start_page
+        text_end_idx = (
+            (abs_end - batch_start_page + 1) if abs_end is not None else len(page_texts)
+        )
+        # Clamp to valid range (guards against LLM hallucination)
+        text_start_idx = max(0, min(text_start_idx, len(page_texts) - 1))
+        text_end_idx   = max(text_start_idx + 1, min(text_end_idx, len(page_texts)))
 
         # Collect the text belonging to this report
-        text_start_idx = rel_start - 1
-        text_end_idx = rel_end if rel_end is not None else len(page_texts)
         report_text = "\n\n".join(page_texts[text_start_idx:text_end_idx])
 
         results.append(
@@ -173,18 +177,25 @@ claim file summary.
 
 RELEVANT — include these document types:
 - Insurer's examinations / independent medical examinations (IME)
-- OCF-18 Treatment and Assessment Plans
 - Occupational therapy assessments and reports
 - Physiotherapy assessments and reports
 - Psychology or psychiatry assessments and reports
 - Specialist medical opinions (orthopaedic, neurology, physiatry, pain medicine, etc.)
 - Disability Certificates (OCF-3)
+- Applications for Accident Benefits (OCF-1)
+- Applications for Determination of Catastrophic Impairment (OCF-19)
 - Functional capacity evaluations
 - Neuropsychological assessments
 - Catastrophic impairment assessments
+- Ambulance call reports / pre-hospital care reports / paramedic notes
+- Hospital admission notes or reports
+- Hospital discharge notes or reports (including discharge summaries that describe diagnosis
+  and functional status at discharge)
+- Consultation notes or letters from any specialist or treating clinician
 
 NOT RELEVANT — exclude these document types:
-- Hospital admission or discharge summaries and nursing notes
+- OCF-18 Treatment and Assessment Plans
+- Routine nursing notes and nursing flow sheets
 - Pharmacy records or medication lists
 - Basic lab results or diagnostic imaging readings (X-ray, MRI, CT) without specialist
   interpretation
@@ -252,26 +263,36 @@ FORMAT RULES
 CONTENT RULES
 1. Open with the author's full name and credential/role (e.g., "Dr. Mohamed Khaled, Physician," or
    "Laura Nelson, Occupational Therapist (College Registration Number G1911702),").
-   - If the document has no identifiable author (e.g., an OCF-3 form), omit the author line.
+   - If the document has no identifiable author (e.g., an OCF-1 or OCF-3 form), omit the author line.
 2. State what the author did: "completed", "authored", "prepared", etc.
 3. Name the document type exactly as it appears in the document (e.g.,
-   INSURER'S EXAMINATION – MEDICAL PHYSICIAN ASSESSMENT, OCF-18 Treatment and Assessment Plan,
-   Occupational Therapy Initial Report, Disability Certificate (OCF-3)).
-   - For OCF-18 plans include the effective date in parentheses, e.g. "(Effective date 2016-10-01)".
+   INSURER'S EXAMINATION – MEDICAL PHYSICIAN ASSESSMENT, Occupational Therapy Initial Report,
+   Disability Certificate (OCF-3), Ambulance Call Report, Consultation Note).
 4. Include the document date (e.g., "dated December 30, 2025").
 5. Summarize the key content:
    - For independent medical examinations (IME) / insurer's examinations: describe the clinical
      findings, diagnosed injuries, accident causation opinions, functional limitations, aids used,
-     and any pre-existing condition findings. If the examiner also opines on a disputed OCF-18,
-     address that in a separate paragraph starting "With respect to the disputed OCF-18 dated
-     [date], in the amount of $[amount], [Author last name] opined that…", and list the services.
-   - For OCF-18 Treatment and Assessment Plans: state the total dollar amount, the proposed
-     service categories, and whether the plan was approved and for what amount.
+     and any pre-existing condition findings.
    - For clinical/therapy reports (OT, PT, psychology, etc.): describe the claimant's functional
      status, impairments, symptoms, and any recommended interventions or equipment.
    - For Disability Certificates (OCF-3): list the accident-related injuries identified, and
      describe the functional limitations documented (complete inability to carry on normal life,
      substantial inability to perform housekeeping, etc.).
+   - For Applications for Accident Benefits (OCF-1): state the date of accident, the nature of
+     injuries reported by the claimant, and the benefits applied for.
+   - For Applications for Determination of Catastrophic Impairment (OCF-19): identify who
+     submitted the application, the basis for the catastrophic impairment claim (e.g., the
+     applicable criterion), and the injuries or impairments relied upon.
+   - For ambulance call reports / pre-hospital care reports: describe the reported mechanism of
+     injury, the patient's condition and complaints at the scene, vital signs if documented, and
+     any treatment administered by paramedics.
+   - For admission notes: describe the presenting complaint, initial clinical findings, working
+     diagnosis on admission, and any immediate treatment ordered.
+   - For discharge notes / discharge summaries: describe the discharge diagnosis, the patient's
+     functional status and condition at discharge, and any follow-up or rehabilitation plan.
+   - For consultation notes or letters: identify the consulting specialist and the referring
+     clinician, describe the reason for referral, the clinical findings, the specialist's
+     diagnosis or impression, and any recommended treatment or further investigations.
 6. Refer to the author by last name (with appropriate title) after the first mention.
 7. Do not invent or extrapolate information that is not in the document text.
 """

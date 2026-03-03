@@ -127,9 +127,9 @@ class TestDetectBoundaries:
         assert results[0].end_page == 3
         assert results[1].end_page is None
 
-    def test_converts_relative_to_absolute_page_numbers(self):
-        """Claude returns 1-based page numbers within the batch; pipeline needs absolute."""
-        payload = json.dumps([{"title": "Report", "start_page": 1, "end_page": 2}])
+    def test_absolute_page_numbers_preserved(self):
+        """Claude returns absolute page numbers matching the --- PAGE N --- labels."""
+        payload = json.dumps([{"title": "Report", "start_page": 11, "end_page": 12}])
         results = detect_boundaries(["p1", "p2"], batch_start_page=11, client=_make_client(payload))
         assert results[0].start_page == 11
         assert results[0].end_page == 12

@@ -20,6 +20,7 @@ Without R2, uploaded file bytes are passed directly to the pipeline in memory.
 import io
 import json
 import os
+import uuid as _uuid
 
 import anthropic
 import streamlit as st
@@ -27,7 +28,11 @@ import streamlit as st
 from src.pipeline import process_pdf
 from src.report_analyzer import ReportSummary
 from src.docx_writer import generate_word_document
-from src.db import init_db, save_run, list_runs, get_run_summaries, delete_run
+from src.db import (
+    init_db, save_run, list_runs, get_run_summaries, delete_run,
+    list_sessions, get_session_summaries, delete_session,
+    save_prompt, list_prompts, delete_prompt,
+)
 
 init_db()
 
@@ -104,14 +109,27 @@ def _render_r2_upload_widget(presigned: dict, filename: str) -> None:
   #r2-btn    {{ background: #1f6aa5; color: #fff; border: none; border-radius: 4px;
                 padding: 7px 18px; font-size: 14px; cursor: pointer; }}
   #r2-btn:disabled {{ background: #888; cursor: not-allowed; }}
-  #r2-prog   {{ width: 100%; margin-top: 8px; display: none; }}
-  #r2-status {{ margin-top: 8px; font-size: 13px; min-height: 18px; }}
+  #r2-prog-wrap {{ display: none; margin-top: 10px; }}
+  #r2-bar-bg  {{ background: #e0e0e0; border-radius: 5px; height: 22px;
+                 position: relative; overflow: hidden; }}
+  #r2-bar-fill {{ background: #1f6aa5; height: 100%; width: 0%;
+                  border-radius: 5px; transition: width 0.15s ease; }}
+  #r2-pct     {{ position: absolute; top: 50%; left: 50%;
+                 transform: translate(-50%, -50%);
+                 font-size: 12px; font-weight: 700; color: #fff;
+                 text-shadow: 0 0 3px rgba(0,0,0,0.4); pointer-events: none; }}
+  #r2-status {{ margin-top: 6px; font-size: 13px; min-height: 18px; }}
 </style>
 <div id="r2box">
   <label>Upload PDF directly to R2 (large files supported)</label>
   <input type="file" id="r2-file" accept=".pdf" />
   <button id="r2-btn" onclick="doUpload()">Upload to R2</button>
-  <progress id="r2-prog" value="0" max="100"></progress>
+  <div id="r2-prog-wrap">
+    <div id="r2-bar-bg">
+      <div id="r2-bar-fill"></div>
+      <span id="r2-pct">0%</span>
+    </div>
+  </div>
   <div id="r2-status">Select the file <b>{filename}</b> then click Upload.</div>
 </div>
 <script>
@@ -120,10 +138,12 @@ const FIELDS   = {fields_json};
 const HINT     = {hint};
 
 function doUpload() {{
-  const inp  = document.getElementById('r2-file');
-  const stat = document.getElementById('r2-status');
-  const prog = document.getElementById('r2-prog');
-  const btn  = document.getElementById('r2-btn');
+  const inp      = document.getElementById('r2-file');
+  const stat     = document.getElementById('r2-status');
+  const progWrap = document.getElementById('r2-prog-wrap');
+  const barFill  = document.getElementById('r2-bar-fill');
+  const pctLabel = document.getElementById('r2-pct');
+  const btn      = document.getElementById('r2-btn');
 
   if (!inp.files || !inp.files.length) {{
     stat.style.color = '#c00';
@@ -138,8 +158,9 @@ function doUpload() {{
   form.append('file', file);
 
   btn.disabled = true;
-  prog.style.display = 'block';
-  prog.value = 0;
+  progWrap.style.display = 'block';
+  barFill.style.width = '0%';
+  pctLabel.textContent = '0%';
   stat.style.color = '#333';
   stat.textContent = 'Uploading\u2026';
 
@@ -148,15 +169,16 @@ function doUpload() {{
   xhr.upload.addEventListener('progress', e => {{
     if (e.lengthComputable) {{
       const pct = Math.round(e.loaded / e.total * 100);
-      prog.value = pct;
+      barFill.style.width = pct + '%';
+      pctLabel.textContent = pct + '%';
       stat.textContent = (e.loaded / 1048576).toFixed(1) + ' MB / '
-        + (e.total / 1048576).toFixed(1) + ' MB (' + pct + '%)';
+        + (e.total / 1048576).toFixed(1) + ' MB';
     }}
   }});
 
   xhr.addEventListener('load', () => {{
     btn.disabled = false;
-    prog.style.display = 'none';
+    progWrap.style.display = 'none';
     if (xhr.status >= 200 && xhr.status < 300) {{
       stat.style.color = '#1a7a1a';
       stat.textContent = '\u2713 Upload complete! Click \u201cConfirm upload\u201d below.';
@@ -169,7 +191,7 @@ function doUpload() {{
 
   xhr.addEventListener('error', () => {{
     btn.disabled = false;
-    prog.style.display = 'none';
+    progWrap.style.display = 'none';
     stat.style.color = '#c00';
     stat.textContent = 'Network error. Check your connection and that the R2 bucket '
       + 'CORS policy allows this origin.';
@@ -219,6 +241,9 @@ if "pending_upload" not in st.session_state:
     # Holds presigned POST state between Streamlit reruns while user uploads
     st.session_state["pending_upload"] = None
 
+if "summary_prompt" not in st.session_state:
+    st.session_state["summary_prompt"] = _DEFAULT_PROMPT
+
 # ---------------------------------------------------------------------------
 # Input form
 # ---------------------------------------------------------------------------
@@ -245,15 +270,44 @@ else:
 
 st.subheader("Summarization Prompt")
 
+# --- Load a saved prompt ---
+_saved_prompts = list_prompts()
+if _saved_prompts:
+    with st.expander(f"Saved prompts ({len(_saved_prompts)})"):
+        for _sp in _saved_prompts:
+            _col_name, _col_load, _col_del = st.columns([5, 1, 1])
+            _col_name.write(_sp["name"])
+            if _col_load.button("Load", key=f"load_prompt_{_sp['id']}"):
+                st.session_state["summary_prompt"] = _sp["text"]
+                st.rerun()
+            if _col_del.button("🗑", key=f"del_prompt_{_sp['id']}", help="Delete this prompt"):
+                delete_prompt(_sp["id"])
+                st.rerun()
+
+# --- Edit area (key keeps value in sync with session state) ---
 summary_prompt = st.text_area(
     "Prompt sent to Claude for each relevant report",
-    value=_DEFAULT_PROMPT,
-    height=120,
+    key="summary_prompt",
+    height=250,
     help=(
         "Edit this prompt to change how each report is summarized. "
         "The claimant's name is automatically prepended."
     ),
 )
+
+# --- Save current prompt ---
+_col_pname, _col_psave = st.columns([4, 1])
+with _col_pname:
+    _prompt_save_name = st.text_input(
+        "Save prompt as",
+        placeholder="e.g. Standard auto insurance",
+        label_visibility="collapsed",
+    )
+with _col_psave:
+    if st.button("Save prompt", disabled=not _prompt_save_name.strip()):
+        save_prompt(_prompt_save_name.strip(), summary_prompt)
+        st.success(f'Saved "{_prompt_save_name.strip()}"')
+        st.rerun()
 
 st.subheader("Settings")
 
@@ -398,25 +452,26 @@ elif not _api_key:
 # Past runs history
 # ---------------------------------------------------------------------------
 
-_past_runs = list_runs()
-if _past_runs:
-    with st.expander(f"Past runs ({len(_past_runs)})"):
-        for run in _past_runs:
+_past_sessions = list_sessions()
+if _past_sessions:
+    with st.expander(f"Past runs ({len(_past_sessions)})"):
+        for session in _past_sessions:
             col_claimant, col_file, col_date, col_count, col_dl, col_del = st.columns(
                 [2, 2, 2, 1, 1, 1]
             )
-            col_claimant.write(run["claimant"])
-            col_file.write(run["filename"])
-            col_date.write(run["created_at"][:10])
-            col_count.write(str(run["report_count"]))
+            col_claimant.write(session["claimant"])
+            col_file.write(session["filenames"])
+            col_date.write(session["created_at"][:16].replace("T", " ") + " UTC")
+            col_count.write(str(session["report_count"]))
 
-            dl_label  = f"dl_{run['id']}"
-            del_label = f"del_{run['id']}"
+            sid       = session["session_id"]
+            dl_label  = f"dl_{sid}"
+            del_label = f"del_{sid}"
 
             try:
-                run_summaries = get_run_summaries(run["id"])
-                docx_bytes    = generate_word_document(run["claimant"], run_summaries)
-                safe          = run["claimant"].replace(" ", "_")
+                session_summaries = get_session_summaries(sid)
+                docx_bytes        = generate_word_document(session["claimant"], session_summaries)
+                safe              = session["claimant"].replace(" ", "_")
                 col_dl.download_button(
                     label="⬇",
                     data=docx_bytes,
@@ -430,7 +485,7 @@ if _past_runs:
 
             if col_del.button("🗑", key=del_label, help="Delete this run"):
                 try:
-                    delete_run(run["id"])
+                    delete_session(sid)
                 except Exception as e:
                     st.error(f"Could not delete run: {e}")
                 st.rerun()
@@ -441,6 +496,19 @@ if _past_runs:
 
 if st.button("Process documents", disabled=not ready, type="primary"):
     all_summaries = []
+    skipped_reports = []   # list of dicts: {reason, title, start_page, end_page, file}
+    session_id = _uuid.uuid4().hex
+
+    def make_skip_callback(f_label):
+        def _on_skipped(reason, title, start_page, end_page):
+            skipped_reports.append({
+                "reason":     reason,
+                "title":      title,
+                "start_page": start_page,
+                "end_page":   end_page,
+                "file":       f_label,
+            })
+        return _on_skipped
 
     if r2_configured:
         from src.r2_storage import download_as_bytes
@@ -495,6 +563,7 @@ if st.button("Process documents", disabled=not ready, type="primary"):
                 analysis_model=analysis_model,
                 claimant_name=claimant_name.strip(),
                 on_progress=make_progress_callback(file_idx, file_label, total_files),
+                on_skipped=make_skip_callback(file_label),
             )
 
             offset = len(all_summaries)
@@ -509,7 +578,7 @@ if st.button("Process documents", disabled=not ready, type="primary"):
 
             if file_summaries:
                 try:
-                    save_run(claimant_name.strip(), file_label, file_summaries)
+                    save_run(claimant_name.strip(), file_label, file_summaries, session_id=session_id)
                 except Exception as e:
                     st.warning(f"Could not save results to database: {e}")
 
@@ -562,6 +631,19 @@ if st.button("Process documents", disabled=not ready, type="primary"):
         )
     else:
         st.success(f"Found **{len(all_summaries)}** relevant report(s).")
+
+        if skipped_reports:
+            with st.expander(f"Skipped / filtered reports ({len(skipped_reports)})"):
+                for sk in skipped_reports:
+                    reason_label = {
+                        "not_relevant": "Not relevant",
+                        "no_text":      "No OCR text",
+                        "duplicate":    "Duplicate",
+                    }.get(sk["reason"], sk["reason"])
+                    st.write(
+                        f"**{reason_label}** — {sk['title']} "
+                        f"(pages {sk['start_page']}–{sk['end_page']}, file: {sk['file']})"
+                    )
 
         st.subheader("Summaries")
         for s in all_summaries:
