@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS saved_prompts (
     text       TEXT    NOT NULL,
     created_at TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -209,3 +214,25 @@ def delete_prompt(prompt_id: int, db_path: str = DB_PATH) -> None:
     """Delete a saved prompt by its id."""
     with sqlite3.connect(db_path) as con:
         con.execute("DELETE FROM saved_prompts WHERE id = ?", (prompt_id,))
+
+
+# ---------------------------------------------------------------------------
+# App settings (key/value store)
+# ---------------------------------------------------------------------------
+
+
+def get_setting(key: str, default: str = "", db_path: str = DB_PATH) -> str:
+    with sqlite3.connect(db_path) as con:
+        row = con.execute(
+            "SELECT value FROM app_settings WHERE key = ?", (key,)
+        ).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str, db_path: str = DB_PATH) -> None:
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )

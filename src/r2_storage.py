@@ -86,30 +86,25 @@ def list_uploads(client, bucket: str, prefix: str = "uploads/") -> List[Dict[str
     return items
 
 
-def generate_presigned_post(
+def generate_presigned_put(
     client,
     bucket: str,
     object_key: str,
     expires_in: int = 3600,
-) -> dict:
+) -> str:
     """
-    Generate a presigned POST URL + form fields for a direct browser-to-R2 upload.
+    Generate a presigned PUT URL for a direct browser-to-R2 upload.
 
-    The browser POSTs a multipart/form-data request directly to R2,
-    bypassing any intermediate server (e.g. Railway's reverse proxy).
-
-    Returns:
-        dict with "url" (str) and "fields" (dict of form fields that must be
-        submitted alongside the file, with "file" appended last per S3 spec).
+    The browser PUTs the raw file bytes to this URL with Content-Type=application/pdf.
+    No form fields are needed. Returns the URL string.
     """
-    return client.generate_presigned_post(
-        Bucket=bucket,
-        Key=object_key,
-        Fields={"Content-Type": "application/pdf"},
-        Conditions=[
-            {"Content-Type": "application/pdf"},
-            ["content-length-range", 1, 2 * 1024 * 1024 * 1024],  # 2 GB max
-        ],
+    return client.generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": bucket,
+            "Key": object_key,
+            "ContentType": "application/pdf",
+        },
         ExpiresIn=expires_in,
     )
 

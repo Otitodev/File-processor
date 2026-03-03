@@ -13,7 +13,7 @@ All credentials are read from environment variables — never shown in the UI:
     R2_BUCKET_NAME        — R2 bucket name
 
 When R2_ENABLED=true, large PDFs are uploaded directly from the browser to R2
-via a presigned POST URL, bypassing the Railway reverse proxy entirely.
+via a presigned PUT URL, bypassing the Railway reverse proxy entirely.
 Without R2, uploaded file bytes are passed directly to the pipeline in memory.
 """
 
@@ -32,6 +32,7 @@ from src.db import (
     init_db, save_run, list_runs, get_run_summaries, delete_run,
     list_sessions, get_session_summaries, delete_session,
     save_prompt, list_prompts, delete_prompt,
+    get_setting, set_setting,
 )
 
 init_db()
@@ -40,12 +41,19 @@ init_db()
 # Credentials — read from environment, never shown in UI
 # ---------------------------------------------------------------------------
 
-_api_key    = os.environ.get("ANTHROPIC_API_KEY", "")
-_r2_enabled = os.environ.get("R2_ENABLED", "").lower() in ("1", "true", "yes")
-_r2_account = os.environ.get("R2_ACCOUNT_ID", "")
-_r2_access  = os.environ.get("R2_ACCESS_KEY_ID", "")
-_r2_secret  = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-_r2_bucket  = os.environ.get("R2_BUCKET_NAME", "")
+_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def _env_or_db(env_key: str, db_key: str) -> str:
+    return os.environ.get(env_key) or get_setting(db_key)
+
+
+_r2_enabled = os.environ.get("R2_ENABLED", "").lower() in ("1", "true", "yes") \
+              or get_setting("r2_enabled") == "true"
+_r2_account = _env_or_db("R2_ACCOUNT_ID",       "r2_account_id")
+_r2_access  = _env_or_db("R2_ACCESS_KEY_ID",     "r2_access_key_id")
+_r2_secret  = _env_or_db("R2_SECRET_ACCESS_KEY", "r2_secret_access_key")
+_r2_bucket  = _env_or_db("R2_BUCKET_NAME",       "r2_bucket_name")
 
 r2_configured = _r2_enabled and bool(_r2_account and _r2_access and _r2_secret and _r2_bucket)
 
@@ -80,20 +88,15 @@ def _get_r2_client():
     ))
 
 
-def _render_r2_upload_widget(presigned: dict, filename: str) -> None:
+def _render_r2_upload_widget(put_url: str, filename: str) -> None:
     """
-    Render an HTML/JS upload widget that POSTs a file directly to R2
-    using a presigned POST URL. No data passes through Railway's proxy.
-
-    Args:
-        presigned: dict with "url" and "fields" from generate_presigned_post().
-        filename:  Expected filename, shown as a hint to the user.
+    Render an HTML/JS upload widget that PUTs a file directly to R2
+    using a presigned PUT URL. No data passes through Railway's proxy.
     """
     import json as _json
 
-    fields_json = _json.dumps(presigned["fields"])
-    post_url    = _json.dumps(presigned["url"])
-    hint        = _json.dumps(filename)
+    url_json = _json.dumps(put_url)
+    hint     = _json.dumps(filename)
 
     widget_html = f"""
 <style>
@@ -133,9 +136,8 @@ def _render_r2_upload_widget(presigned: dict, filename: str) -> None:
   <div id="r2-status">Select the file <b>{filename}</b> then click Upload.</div>
 </div>
 <script>
-const POST_URL = {post_url};
-const FIELDS   = {fields_json};
-const HINT     = {hint};
+const PUT_URL = {url_json};
+const HINT    = {hint};
 
 function doUpload() {{
   const inp      = document.getElementById('r2-file');
@@ -152,10 +154,6 @@ function doUpload() {{
   }}
 
   const file = inp.files[0];
-  const form = new FormData();
-  // Presigned fields must come before the file (S3/R2 spec)
-  for (const [k, v] of Object.entries(FIELDS)) form.append(k, v);
-  form.append('file', file);
 
   btn.disabled = true;
   progWrap.style.display = 'block';
@@ -193,12 +191,12 @@ function doUpload() {{
     btn.disabled = false;
     progWrap.style.display = 'none';
     stat.style.color = '#c00';
-    stat.textContent = 'Network error. Check your connection and that the R2 bucket '
-      + 'CORS policy allows this origin.';
+    stat.textContent = 'Network error. Check R2 CORS policy allows PUT from this origin.';
   }});
 
-  xhr.open('POST', POST_URL);
-  xhr.send(form);
+  xhr.open('PUT', PUT_URL);
+  xhr.setRequestHeader('Content-Type', 'application/pdf');
+  xhr.send(file);
 }}
 </script>
 """
@@ -330,12 +328,52 @@ with col2:
         help="Model used for boundary detection, relevance filtering, and summarization.",
     )
 
+# Show setup only when R2 is not yet working (credentials missing)
+if not r2_configured:
+    with st.expander("⚠️ File upload not configured — set up R2 storage"):
+        st.markdown(
+            "Large PDFs fail to upload through Railway's proxy. "
+            "Direct-to-R2 upload bypasses it entirely. "
+            "**Free tier is enough** (10 GB storage, unlimited egress).\n\n"
+            "**Get credentials in ~2 minutes:**\n"
+            "1. [cloudflare.com/r2](https://dash.cloudflare.com/) → R2 → Create bucket\n"
+            "2. Manage R2 API Tokens → Create Token (Object Read & Write on that bucket)\n"
+            "3. Copy Account ID, Access Key ID, Secret Access Key, and bucket name below."
+        )
+        with st.form("r2_setup_form"):
+            _acct   = st.text_input("Account ID",        value=get_setting("r2_account_id"))
+            _access = st.text_input("Access Key ID",     value=get_setting("r2_access_key_id"))
+            _secret = st.text_input("Secret Access Key", value=get_setting("r2_secret_access_key"), type="password")
+            _bucket = st.text_input("Bucket name",       value=get_setting("r2_bucket_name"))
+            _col_save, _col_clear = st.columns([2, 1])
+            _submitted = _col_save.form_submit_button("Save & activate", type="primary")
+            _cleared   = _col_clear.form_submit_button("Clear credentials")
+
+        if _submitted:
+            if _acct and _access and _secret and _bucket:
+                set_setting("r2_enabled",          "true")
+                set_setting("r2_account_id",        _acct)
+                set_setting("r2_access_key_id",     _access)
+                set_setting("r2_secret_access_key", _secret)
+                set_setting("r2_bucket_name",       _bucket)
+                st.success("R2 credentials saved — reloading…")
+                st.rerun()
+            else:
+                st.error("Fill in all four fields.")
+
+        if _cleared:
+            for _k in ("r2_enabled", "r2_account_id", "r2_access_key_id",
+                       "r2_secret_access_key", "r2_bucket_name"):
+                set_setting(_k, "")
+            st.info("Credentials cleared — reloading…")
+            st.rerun()
+
 # ---------------------------------------------------------------------------
 # R2 direct upload (when R2_ENABLED=true)
 # ---------------------------------------------------------------------------
 
 if r2_configured:
-    from src.r2_storage import make_object_key, generate_presigned_post
+    from src.r2_storage import make_object_key, generate_presigned_put
 
     st.subheader("Upload file to R2")
 
@@ -361,16 +399,16 @@ if r2_configured:
             if needs_new:
                 client = _get_r2_client()
                 object_key = make_object_key(claimant_name.strip(), pdf_filename)
-                presigned  = generate_presigned_post(client, _r2_bucket, object_key)
+                put_url = generate_presigned_put(client, _r2_bucket, object_key)
                 st.session_state["pending_upload"] = {
                     "filename":      pdf_filename,
                     "object_key":    object_key,
-                    "presigned":     presigned,
+                    "put_url":       put_url,
                     "claimant_name": claimant_name.strip(),
                 }
                 pending = st.session_state["pending_upload"]
 
-            _render_r2_upload_widget(pending["presigned"], pdf_filename)
+            _render_r2_upload_widget(pending["put_url"], pdf_filename)
 
             if st.button("✓ Confirm upload", key="r2_confirm"):
                 from src.r2_storage import object_exists, get_object_size
