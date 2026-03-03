@@ -29,6 +29,13 @@ from .report_analyzer import (
 )
 
 
+def _is_docx(source: Union[str, bytes]) -> bool:
+    """Return True if source looks like a .docx file (ZIP magic bytes or .docx extension)."""
+    if isinstance(source, bytes):
+        return source[:4] == b"PK\x03\x04"
+    return str(source).lower().endswith(".docx")
+
+
 def _load_progress(progress_file: str) -> dict:
     if os.path.exists(progress_file):
         with open(progress_file) as f:
@@ -55,12 +62,13 @@ def process_pdf(
     claimant_name: str = "",
     on_progress: Optional[Callable[[float, str], None]] = None,
     on_skipped: Optional[Callable[[str, str, int, int], None]] = None,
+    excluded_types: Optional[List[str]] = None,
 ) -> List[ReportSummary]:
     """
-    Full pipeline: PDF → list of summarized reports.
+    Full pipeline: PDF/DOCX → list of summarized reports.
 
     Args:
-        pdf_source:      Path to the input PDF, or raw PDF bytes (e.g. downloaded from R2).
+        pdf_source:      Path to the input PDF/DOCX, or raw file bytes.
         summary_prompt:  Custom prompt for how to summarize each report.
         api_key:         Anthropic API key.
         output_path:     Where to write the final JSON results.
@@ -76,11 +84,14 @@ def process_pdf(
                          stage. fraction is 0.0–1.0. Falls back to print() when None.
         on_skipped:      Optional callback(reason, title, start_page, end_page) fired
                          whenever a detected report is not summarized. reason is one of:
-                         "no_text" | "not_relevant" | "duplicate".
+                         "no_text" | "not_relevant" | "duplicate" | "excluded_type".
+        excluded_types:  Report type names to skip before summarization (Feature 9).
 
     Returns:
         List of ReportSummary objects for relevant documents only.
     """
+    if excluded_types is None:
+        excluded_types = []
 
     def _log(fraction: float, message: str) -> None:
         if on_progress is not None:
@@ -89,7 +100,16 @@ def process_pdf(
             print(message)
 
     client = anthropic.Anthropic(api_key=api_key)
-    total_pages = get_page_count(pdf_source)
+
+    # Detect .docx input (Feature 8) — extract texts now so total_pages is known
+    if _is_docx(pdf_source):
+        from .docx_extractor import docx_to_page_texts as _docx_to_pages
+        _docx_texts: Optional[List[str]] = _docx_to_pages(pdf_source)
+        total_pages = len(_docx_texts) or 1
+    else:
+        _docx_texts = None
+        total_pages = get_page_count(pdf_source)
+
     state = _load_progress(progress_file)
 
     summaries: List[ReportSummary] = [
@@ -107,7 +127,8 @@ def process_pdf(
     if claimant_name:
         effective_prompt = f"Claimant: {claimant_name}\n\n{summary_prompt}"
 
-    _log(0.0, f"PDF has {total_pages} pages. Resuming from page {last_completed_page + 1}.")
+    _doc_kind = "document" if _docx_texts is not None else "PDF"
+    _log(0.0, f"{_doc_kind} has {total_pages} pages. Resuming from page {last_completed_page + 1}.")
 
     # Track finalized start pages to prevent duplicates from the overlap zone.
     # Seed from restored summaries so a resumed run doesn't re-finalize them.
@@ -129,6 +150,12 @@ def process_pdf(
                 on_skipped("duplicate", boundary.title, boundary.start_page, boundary.end_page)
             return
         finalized_start_pages.add(boundary.start_page)
+        # Skip by excluded type before relevance check (saves API calls)
+        if excluded_types and boundary.report_type in excluded_types:
+            _log(fraction, f"Skipped (excluded type '{boundary.report_type}'): {boundary.title}")
+            if on_skipped is not None:
+                on_skipped("excluded_type", boundary.title, boundary.start_page, boundary.end_page)
+            return
         if classify_relevance(boundary, claimant_name, client, analysis_model):
             summary = summarize_report(
                 report=boundary,
@@ -145,9 +172,26 @@ def process_pdf(
             if on_skipped is not None:
                 on_skipped("not_relevant", boundary.title, boundary.start_page, boundary.end_page)
 
-    batch_iter = iter_page_batches(pdf_source, batch_size=batch_size, dpi=dpi, overlap=overlap)
+    if _docx_texts is not None:
+        # Docx path: build a generator that yields (batch_start, batch_end, text_slice)
+        def _docx_batch_iter():
+            step = max(1, batch_size - overlap)
+            n = len(_docx_texts)
+            start = 1  # 1-based virtual page numbers
+            while start <= n:
+                end = min(start + batch_size - 1, n)
+                yield start, end, _docx_texts[start - 1:end]
+                start += step
+        _main_iter = ((bs, be, texts) for bs, be, texts in _docx_batch_iter())
+    else:
+        _main_iter = (
+            (bs, be, imgs)
+            for bs, be, imgs in iter_page_batches(
+                pdf_source, batch_size=batch_size, dpi=dpi, overlap=overlap
+            )
+        )
 
-    for batch_start, batch_end, images in batch_iter:
+    for batch_start, batch_end, batch_payload in _main_iter:
         # Skip batches we've already processed (resume support)
         if batch_end <= last_completed_page:
             continue
@@ -155,10 +199,14 @@ def process_pdf(
         fraction = batch_end / total_pages
 
         # ------------------------------------------------------------------
-        # Step 1: OCR
+        # Step 1: OCR (PDF path) or pass-through (docx path)
         # ------------------------------------------------------------------
-        _log(fraction, f"OCR: pages {batch_start}–{batch_end} of {total_pages}")
-        page_texts = ocr_batch(images, backend=ocr_backend, client=client)
+        if _docx_texts is not None:
+            _log(fraction, f"Analyzing virtual pages {batch_start}–{batch_end} of {total_pages}")
+            page_texts = batch_payload  # already strings
+        else:
+            _log(fraction, f"OCR: pages {batch_start}–{batch_end} of {total_pages}")
+            page_texts = ocr_batch(batch_payload, backend=ocr_backend, client=client)
 
         # ------------------------------------------------------------------
         # Step 2: Detect report boundaries in this batch

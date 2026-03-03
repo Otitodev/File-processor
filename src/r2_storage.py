@@ -91,11 +91,12 @@ def generate_presigned_put(
     bucket: str,
     object_key: str,
     expires_in: int = 3600,
+    content_type: str = "application/pdf",
 ) -> str:
     """
     Generate a presigned PUT URL for a direct browser-to-R2 upload.
 
-    The browser PUTs the raw file bytes to this URL with Content-Type=application/pdf.
+    The browser PUTs the raw file bytes to this URL with the given Content-Type.
     No form fields are needed. Returns the URL string.
     """
     return client.generate_presigned_url(
@@ -103,7 +104,7 @@ def generate_presigned_put(
         Params={
             "Bucket": bucket,
             "Key": object_key,
-            "ContentType": "application/pdf",
+            "ContentType": content_type,
         },
         ExpiresIn=expires_in,
     )

@@ -36,13 +36,25 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE TABLE IF NOT EXISTS reports (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id       INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-    report_index INTEGER NOT NULL,
-    title        TEXT    NOT NULL,
-    start_page   INTEGER NOT NULL,
-    end_page     INTEGER NOT NULL,
-    summary      TEXT    NOT NULL
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id          INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    report_index    INTEGER NOT NULL,
+    title           TEXT    NOT NULL,
+    start_page      INTEGER NOT NULL,
+    end_page        INTEGER NOT NULL,
+    summary         TEXT    NOT NULL,
+    source_filename TEXT    NOT NULL DEFAULT '',
+    report_type     TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS skipped_reports (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT    NOT NULL,
+    filename   TEXT    NOT NULL,
+    reason     TEXT    NOT NULL,
+    title      TEXT    NOT NULL,
+    start_page INTEGER NOT NULL,
+    end_page   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS saved_prompts (
@@ -75,6 +87,16 @@ def init_db(db_path: str = DB_PATH) -> None:
             pass  # column already exists
         # Backfill legacy rows so every run has a unique non-empty session_id
         con.execute("UPDATE runs SET session_id = 'legacy_' || id WHERE session_id = ''")
+        # Add source_filename column to reports (Feature 7)
+        try:
+            con.execute("ALTER TABLE reports ADD COLUMN source_filename TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
+        # Add report_type column to reports (Feature 9)
+        try:
+            con.execute("ALTER TABLE reports ADD COLUMN report_type TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
 
 
 def save_run(
@@ -98,10 +120,11 @@ def save_run(
         )
         run_id = cur.lastrowid
         con.executemany(
-            "INSERT INTO reports (run_id, report_index, title, start_page, end_page, summary)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO reports (run_id, report_index, title, start_page, end_page, summary,"
+            " source_filename, report_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                (run_id, s.report_index, s.title, s.start_page, s.end_page, s.summary)
+                (run_id, s.report_index, s.title, s.start_page, s.end_page, s.summary,
+                 s.source_filename, s.report_type)
                 for s in summaries
             ],
         )
@@ -168,7 +191,9 @@ def get_session_summaries(session_id: str, db_path: str = DB_PATH) -> List[Repor
     with sqlite3.connect(db_path) as con:
         con.row_factory = sqlite3.Row
         rows = con.execute("""
-            SELECT r.report_index, r.title, r.start_page, r.end_page, r.summary
+            SELECT r.report_index, r.title, r.start_page, r.end_page, r.summary,
+                   COALESCE(NULLIF(r.source_filename, ''), runs.filename) AS source_filename,
+                   r.report_type
             FROM reports r
             JOIN runs ON r.run_id = runs.id
             WHERE runs.session_id = ?
@@ -182,6 +207,43 @@ def delete_session(session_id: str, db_path: str = DB_PATH) -> None:
     with sqlite3.connect(db_path) as con:
         con.execute("PRAGMA foreign_keys = ON")
         con.execute("DELETE FROM runs WHERE session_id = ?", (session_id,))
+        con.execute("DELETE FROM skipped_reports WHERE session_id = ?", (session_id,))
+
+
+# ---------------------------------------------------------------------------
+# Skipped reports (Feature 6)
+# ---------------------------------------------------------------------------
+
+
+def save_skipped(session_id: str, filename: str, skipped: list, db_path: str = DB_PATH) -> None:
+    """
+    Persist skipped report entries for a session + file.
+
+    Each item in `skipped` is a dict with keys: reason, title, start_page, end_page.
+    """
+    if not skipped:
+        return
+    with sqlite3.connect(db_path) as con:
+        con.executemany(
+            "INSERT INTO skipped_reports (session_id, filename, reason, title, start_page, end_page)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (session_id, filename, s["reason"], s["title"], s["start_page"], s["end_page"])
+                for s in skipped
+            ],
+        )
+
+
+def get_session_skipped(session_id: str, db_path: str = DB_PATH) -> list:
+    """Return all skipped report rows for a session, ordered by id."""
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT filename, reason, title, start_page, end_page"
+            " FROM skipped_reports WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------

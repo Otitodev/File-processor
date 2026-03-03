@@ -51,8 +51,12 @@ def generate_word_document(claimant_name: str, summaries: List[ReportSummary]) -
         # Report heading
         doc.add_heading(summary.title, level=2)
 
-        # Page range sub-line in a slightly muted style
-        page_para = doc.add_paragraph(f"Pages {summary.start_page}–{summary.end_page}")
+        # Page range sub-line in a slightly muted style (include filename when available)
+        if summary.source_filename:
+            page_line = f"{summary.source_filename}  \u00b7  Pages {summary.start_page}\u2013{summary.end_page}"
+        else:
+            page_line = f"Pages {summary.start_page}\u2013{summary.end_page}"
+        page_para = doc.add_paragraph(page_line)
         page_para.runs[0].font.size = Pt(10)
         page_para.runs[0].font.color.rgb = RGBColor(0x60, 0x60, 0x60)
 

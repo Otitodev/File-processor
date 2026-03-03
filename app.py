@@ -33,6 +33,7 @@ from src.db import (
     list_sessions, get_session_summaries, delete_session,
     save_prompt, list_prompts, delete_prompt,
     get_setting, set_setting,
+    save_skipped, get_session_skipped,
 )
 
 init_db()
@@ -92,6 +93,7 @@ def _render_r2_upload_widget(put_url: str, filename: str) -> None:
     """
     Render an HTML/JS upload widget that PUTs a file directly to R2
     using a presigned PUT URL. No data passes through Railway's proxy.
+    Supports both PDF and .docx files.
     """
     import json as _json
 
@@ -124,8 +126,8 @@ def _render_r2_upload_widget(put_url: str, filename: str) -> None:
   #r2-status {{ margin-top: 6px; font-size: 13px; min-height: 18px; }}
 </style>
 <div id="r2box">
-  <label>Upload PDF directly to R2 (large files supported)</label>
-  <input type="file" id="r2-file" accept=".pdf" />
+  <label>Upload PDF or Word document directly to R2 (large files supported)</label>
+  <input type="file" id="r2-file" accept=".pdf,.docx" />
   <button id="r2-btn" onclick="doUpload()">Upload to R2</button>
   <div id="r2-prog-wrap">
     <div id="r2-bar-bg">
@@ -139,6 +141,13 @@ def _render_r2_upload_widget(put_url: str, filename: str) -> None:
 const PUT_URL = {url_json};
 const HINT    = {hint};
 
+function getContentType(filename) {{
+  if (filename.toLowerCase().endsWith('.docx')) {{
+    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  }}
+  return 'application/pdf';
+}}
+
 function doUpload() {{
   const inp      = document.getElementById('r2-file');
   const stat     = document.getElementById('r2-status');
@@ -149,7 +158,7 @@ function doUpload() {{
 
   if (!inp.files || !inp.files.length) {{
     stat.style.color = '#c00';
-    stat.textContent = 'Please select a PDF file first.';
+    stat.textContent = 'Please select a file first.';
     return;
   }}
 
@@ -195,7 +204,7 @@ function doUpload() {{
   }});
 
   xhr.open('PUT', PUT_URL);
-  xhr.setRequestHeader('Content-Type', 'application/pdf');
+  xhr.setRequestHeader('Content-Type', getContentType(file.name));
   xhr.send(file);
 }}
 </script>
@@ -258,10 +267,10 @@ claimant_name = st.text_input(
 # below (the native uploader would fail for large files via Railway's proxy).
 if not r2_configured:
     uploaded_files = st.file_uploader(
-        "Upload PDF file(s)",
-        type=["pdf"],
+        "Upload PDF or Word file(s)",
+        type=["pdf", "docx"],
         accept_multiple_files=True,
-        help="You may upload one or more scanned PDF disclosure packages.",
+        help="You may upload one or more scanned PDF disclosure packages or Word (.docx) documents.",
     )
 else:
     uploaded_files = []   # not used in the R2 path
@@ -328,6 +337,25 @@ with col2:
         help="Model used for boundary detection, relevance filtering, and summarization.",
     )
 
+_REPORT_TYPE_OPTIONS = [
+    "IME", "OT Assessment", "PT Assessment", "Psychology", "Psychiatry",
+    "Disability Certificate", "OCF-1", "OCF-19", "OCF-18", "FCE",
+    "Ambulance Report", "Hospital Record", "Consultation Note", "Other",
+]
+
+_saved_excluded = get_setting("excluded_report_types")
+_default_excluded = [t.strip() for t in _saved_excluded.split(",") if t.strip()]
+excluded_types = st.multiselect(
+    "Exclude report types (pre-filter — excluded types are not summarised)",
+    options=_REPORT_TYPE_OPTIONS,
+    default=[t for t in _default_excluded if t in _REPORT_TYPE_OPTIONS],
+    help=(
+        "Selected types are skipped before summarisation, saving API cost. "
+        "Your selection is saved automatically."
+    ),
+)
+set_setting("excluded_report_types", ",".join(excluded_types))
+
 # Show setup only when R2 is not yet working (credentials missing)
 if not r2_configured:
     with st.expander("⚠️ File upload not configured — set up R2 storage"):
@@ -381,15 +409,15 @@ if r2_configured:
         st.info("Enter the claimant's name above before uploading files.")
     else:
         pdf_filename = st.text_input(
-            "PDF filename",
-            placeholder="e.g. Ashok_Kapoor_Med_File.pdf",
-            help="Type the filename of the PDF you are about to upload.",
+            "Filename",
+            placeholder="e.g. Ashok_Kapoor_Med_File.pdf or report.docx",
+            help="Type the filename of the PDF or Word document you are about to upload.",
         ).strip()
 
         if pdf_filename:
             pending = st.session_state["pending_upload"]
 
-            # Generate (or reuse) presigned POST — only regenerate when
+            # Generate (or reuse) presigned PUT — only regenerate when
             # filename or claimant name changes to avoid flickering on reruns.
             needs_new = (
                 pending is None
@@ -399,7 +427,12 @@ if r2_configured:
             if needs_new:
                 client = _get_r2_client()
                 object_key = make_object_key(claimant_name.strip(), pdf_filename)
-                put_url = generate_presigned_put(client, _r2_bucket, object_key)
+                _ct = (
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    if pdf_filename.lower().endswith(".docx")
+                    else "application/pdf"
+                )
+                put_url = generate_presigned_put(client, _r2_bucket, object_key, content_type=_ct)
                 st.session_state["pending_upload"] = {
                     "filename":      pdf_filename,
                     "object_key":    object_key,
@@ -487,46 +520,98 @@ elif not _api_key:
     st.warning("ANTHROPIC_API_KEY environment variable is not set.")
 
 # ---------------------------------------------------------------------------
-# Past runs history
+# Past runs history (Feature 6 — grouped by date with skipped expanders)
 # ---------------------------------------------------------------------------
 
 _past_sessions = list_sessions()
 if _past_sessions:
+    # Group sessions by calendar date from created_at (UTC ISO string)
+    from collections import OrderedDict
+    from datetime import datetime as _dt
+
+    _by_date: "OrderedDict[str, list]" = OrderedDict()
+    for _sess in _past_sessions:
+        try:
+            _d = _dt.fromisoformat(_sess["created_at"].replace("Z", "+00:00"))
+            _date_key = f"{_d.strftime('%B')} {_d.day}, {_d.year}"
+        except Exception:
+            _date_key = _sess["created_at"][:10]
+        _by_date.setdefault(_date_key, []).append(_sess)
+
     with st.expander(f"Past runs ({len(_past_sessions)})"):
-        for session in _past_sessions:
-            col_claimant, col_file, col_date, col_count, col_dl, col_del = st.columns(
-                [2, 2, 2, 1, 1, 1]
-            )
-            col_claimant.write(session["claimant"])
-            col_file.write(session["filenames"])
-            col_date.write(session["created_at"][:16].replace("T", " ") + " UTC")
-            col_count.write(str(session["report_count"]))
+        for _date_label, _sessions_on_date in _by_date.items():
+            st.markdown(f"### {_date_label}")
 
-            sid       = session["session_id"]
-            dl_label  = f"dl_{sid}"
-            del_label = f"del_{sid}"
+            for session in _sessions_on_date:
+                sid = session["session_id"]
 
-            try:
-                session_summaries = get_session_summaries(sid)
-                docx_bytes        = generate_word_document(session["claimant"], session_summaries)
-                safe              = session["claimant"].replace(" ", "_")
-                col_dl.download_button(
-                    label="⬇",
-                    data=docx_bytes,
-                    file_name=f"{safe}_medical_summary.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key=dl_label,
-                    help="Download Word document",
+                # One-line session summary row
+                _col_info, _col_dl, _col_del = st.columns([6, 1, 1])
+                _col_info.write(
+                    f"**{session['claimant']}** — {session['filenames']} "
+                    f"— {session['report_count']} report(s) "
+                    f"— {session['created_at'][11:16]} UTC"
                 )
-            except Exception:
-                col_dl.write("—")
 
-            if col_del.button("🗑", key=del_label, help="Delete this run"):
+                session_summaries = []
                 try:
-                    delete_session(sid)
-                except Exception as e:
-                    st.error(f"Could not delete run: {e}")
-                st.rerun()
+                    session_summaries = get_session_summaries(sid)
+                    docx_bytes        = generate_word_document(session["claimant"], session_summaries)
+                    safe              = session["claimant"].replace(" ", "_")
+                    _col_dl.download_button(
+                        label="⬇",
+                        data=docx_bytes,
+                        file_name=f"{safe}_medical_summary.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"dl_{sid}",
+                        help="Download Word document",
+                    )
+                except Exception:
+                    _col_dl.write("—")
+
+                if _col_del.button("🗑", key=f"del_{sid}", help="Delete this run"):
+                    try:
+                        delete_session(sid)
+                    except Exception as e:
+                        st.error(f"Could not delete run: {e}")
+                    st.rerun()
+
+                # Report details expander
+                with st.expander("View reports", expanded=False):
+                    # Included reports
+                    if session_summaries:
+                        st.markdown("**Included reports**")
+                        for _s in session_summaries:
+                            _loc = (
+                                f"{_s.source_filename}  pp. {_s.start_page}–{_s.end_page}"
+                                if _s.source_filename
+                                else f"pages {_s.start_page}–{_s.end_page}"
+                            )
+                            st.write(f"[{_s.report_index}] {_s.title} ({_loc})")
+                    else:
+                        st.write("No included reports.")
+
+                    # Skipped reports
+                    _skipped = get_session_skipped(sid)
+                    st.markdown("**Skipped reports**")
+                    if _skipped:
+                        _reason_labels = {
+                            "not_relevant":  "Not relevant",
+                            "no_text":       "No OCR text",
+                            "duplicate":     "Duplicate",
+                            "excluded_type": "Excluded by type filter",
+                        }
+                        for _sk in _skipped:
+                            _rl = _reason_labels.get(_sk["reason"], _sk["reason"])
+                            st.write(
+                                f"**{_rl}** — {_sk['title']} "
+                                f"(pages {_sk['start_page']}–{_sk['end_page']}, "
+                                f"file: {_sk['filename']})"
+                            )
+                    else:
+                        st.markdown(
+                            "_Skipped report history not available for runs before this update._"
+                        )
 
 # ---------------------------------------------------------------------------
 # Processing
@@ -537,15 +622,20 @@ if st.button("Process documents", disabled=not ready, type="primary"):
     skipped_reports = []   # list of dicts: {reason, title, start_page, end_page, file}
     session_id = _uuid.uuid4().hex
 
+    # Per-file skipped list (reset each file so filename is accurate for save_skipped)
+    _file_skipped: list = []
+
     def make_skip_callback(f_label):
         def _on_skipped(reason, title, start_page, end_page):
-            skipped_reports.append({
+            entry = {
                 "reason":     reason,
                 "title":      title,
                 "start_page": start_page,
-                "end_page":   end_page,
+                "end_page":   end_page or 0,
                 "file":       f_label,
-            })
+            }
+            skipped_reports.append(entry)
+            _file_skipped.append(entry)
         return _on_skipped
 
     if r2_configured:
@@ -566,6 +656,7 @@ if st.button("Process documents", disabled=not ready, type="primary"):
 
     for file_idx, (file_label, source_ref, r2f_meta) in enumerate(work_items):
         progress_file = f".pipeline_progress_{file_idx}.json"
+        _file_skipped.clear()  # reset per-file skipped list
 
         try:
             file_summaries_before = len(all_summaries)
@@ -602,7 +693,12 @@ if st.button("Process documents", disabled=not ready, type="primary"):
                 claimant_name=claimant_name.strip(),
                 on_progress=make_progress_callback(file_idx, file_label, total_files),
                 on_skipped=make_skip_callback(file_label),
+                excluded_types=excluded_types,
             )
+
+            # Feature 7 — tag each summary with its source filename
+            for s in file_summaries:
+                s.source_filename = file_label
 
             offset = len(all_summaries)
             for s in file_summaries:
@@ -619,6 +715,12 @@ if st.button("Process documents", disabled=not ready, type="primary"):
                     save_run(claimant_name.strip(), file_label, file_summaries, session_id=session_id)
                 except Exception as e:
                     st.warning(f"Could not save results to database: {e}")
+
+            # Feature 6 — persist skipped reports for this file
+            try:
+                save_skipped(session_id, file_label, _file_skipped)
+            except Exception as e:
+                st.warning(f"Could not save skipped reports to database: {e}")
 
         except anthropic.AuthenticationError:
             st.error(
@@ -674,9 +776,10 @@ if st.button("Process documents", disabled=not ready, type="primary"):
             with st.expander(f"Skipped / filtered reports ({len(skipped_reports)})"):
                 for sk in skipped_reports:
                     reason_label = {
-                        "not_relevant": "Not relevant",
-                        "no_text":      "No OCR text",
-                        "duplicate":    "Duplicate",
+                        "not_relevant":  "Not relevant",
+                        "no_text":       "No OCR text",
+                        "duplicate":     "Duplicate",
+                        "excluded_type": "Excluded by type filter",
                     }.get(sk["reason"], sk["reason"])
                     st.write(
                         f"**{reason_label}** — {sk['title']} "
@@ -685,7 +788,12 @@ if st.button("Process documents", disabled=not ready, type="primary"):
 
         st.subheader("Summaries")
         for s in all_summaries:
-            with st.expander(f"[{s.report_index}] {s.title}  (pages {s.start_page}–{s.end_page})"):
+            _loc = (
+                f"{s.source_filename}  pp. {s.start_page}–{s.end_page}"
+                if s.source_filename
+                else f"pages {s.start_page}–{s.end_page}"
+            )
+            with st.expander(f"[{s.report_index}] {s.title}  ({_loc})"):
                 st.write(s.summary)
 
         st.subheader("Download")
