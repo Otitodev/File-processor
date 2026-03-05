@@ -83,7 +83,7 @@ Return a JSON array (no markdown, raw JSON only) with one object per report foun
 [
   {
     "title": "<descriptive title combining: facility/company name if shown + report type + author/assessor name with credential + date, e.g. 'CanAssess Insurer\u2019s Examination \u2013 Psychiatry Assessment \u2013 Dr. Susan MacKenzie dated December 24, 2025'; do NOT include the patient or claimant name>",
-    "type": "<one of: IME | OT Assessment | PT Assessment | Psychology | Psychiatry | Disability Certificate | OCF-1 | OCF-19 | OCF-18 | FCE | Ambulance Report | Hospital Record | Consultation Note | Other>",
+    "type": "<one of: IME | OT Assessment | PT Assessment | Psychology | Psychiatry | Disability Certificate | OCF-1 | OCF-19 | OCF-18 | FCE | Ambulance Report | Hospital Record | Consultation Note | Diagnostic Imaging | Other>",
     "start_page": <the absolute page number from the --- PAGE N --- label where this report begins>,
     "end_page": <the absolute page number from the --- PAGE N --- label where this report ends, or null if it continues past the last page shown>
   }

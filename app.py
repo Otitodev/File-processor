@@ -21,17 +21,24 @@ import io
 import json
 import os
 import uuid as _uuid
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/Toronto")
 
 import anthropic
 import streamlit as st
+import streamlit.components.v1 as _stv1
+from typing import cast
 
 from src.pipeline import process_pdf
+from src.ocr_engine import OCRBackend
 from src.report_analyzer import ReportSummary
 from src.docx_writer import generate_word_document
 from src.db import (
     init_db, save_run, list_runs, get_run_summaries, delete_run,
     list_sessions, get_session_summaries, delete_session,
     save_prompt, list_prompts, delete_prompt,
+    save_exclusion_list, list_exclusion_lists, delete_exclusion_list,
     get_setting, set_setting,
     save_skipped, get_session_skipped,
 )
@@ -43,6 +50,7 @@ init_db()
 # ---------------------------------------------------------------------------
 
 _api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+_app_password = os.environ.get("APP_PASSWORD", "")
 
 
 def _env_or_db(env_key: str, db_key: str) -> str:
@@ -209,7 +217,7 @@ function doUpload() {{
 }}
 </script>
 """
-    st.components.v1.html(widget_html, height=200, scrolling=False)
+    _stv1.html(widget_html, height=200, scrolling=False)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +238,24 @@ st.set_page_config(
     layout="centered",
 )
 
+# ---------------------------------------------------------------------------
+# Authentication gate
+# ---------------------------------------------------------------------------
+if _app_password:
+    if not st.session_state.get("authenticated"):
+        st.markdown("<br>" * 4, unsafe_allow_html=True)
+        _auth_col = st.columns([1, 2, 1])[1]
+        with _auth_col:
+            st.title("Medical Document Analyzer")
+            _pw = st.text_input("Password", type="password", key="login_pw")
+            if st.button("Sign in", use_container_width=True):
+                if _pw == _app_password:
+                    st.session_state["authenticated"] = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect password.")
+        st.stop()
+
 st.title("Medical Document Analyzer")
 st.caption(
     "Processes scanned medical PDFs, filters to relevant reports, "
@@ -249,7 +275,13 @@ if "pending_upload" not in st.session_state:
     st.session_state["pending_upload"] = None
 
 if "summary_prompt" not in st.session_state:
-    st.session_state["summary_prompt"] = _DEFAULT_PROMPT
+    _all_prompts = list_prompts()
+    st.session_state["summary_prompt"] = (
+        _all_prompts[-1]["text"] if _all_prompts else _DEFAULT_PROMPT
+    )
+
+if "excluded_types_loaded" not in st.session_state:
+    st.session_state["excluded_types_loaded"] = None
 
 # ---------------------------------------------------------------------------
 # Input form
@@ -340,11 +372,16 @@ with col2:
 _REPORT_TYPE_OPTIONS = [
     "IME", "OT Assessment", "PT Assessment", "Psychology", "Psychiatry",
     "Disability Certificate", "OCF-1", "OCF-19", "OCF-18", "FCE",
-    "Ambulance Report", "Hospital Record", "Consultation Note", "Other",
+    "Ambulance Report", "Hospital Record", "Consultation Note",
+    "Diagnostic Imaging", "Other",
 ]
 
-_saved_excluded = get_setting("excluded_report_types")
-_default_excluded = [t.strip() for t in _saved_excluded.split(",") if t.strip()]
+_loaded_excl = st.session_state.pop("excluded_types_loaded", None)
+if _loaded_excl is not None:
+    _default_excluded = _loaded_excl
+else:
+    _saved_excluded = get_setting("excluded_report_types")
+    _default_excluded = [t.strip() for t in _saved_excluded.split(",") if t.strip()]
 excluded_types = st.multiselect(
     "Exclude report types (pre-filter — excluded types are not summarised)",
     options=_REPORT_TYPE_OPTIONS,
@@ -355,6 +392,36 @@ excluded_types = st.multiselect(
     ),
 )
 set_setting("excluded_report_types", ",".join(excluded_types))
+
+# Saved exclusion lists
+_saved_excl = list_exclusion_lists()
+if _saved_excl:
+    with st.expander(f"Saved exclusion lists ({len(_saved_excl)})"):
+        for _se in _saved_excl:
+            _ec1, _ec2, _ec3 = st.columns([5, 1, 1])
+            _ec1.write(_se["name"])
+            if _ec2.button("Load", key=f"load_excl_{_se['id']}"):
+                st.session_state["excluded_types_loaded"] = [
+                    t for t in _se["types"].split(",") if t
+                ]
+                st.rerun()
+            if _ec3.button("🗑", key=f"del_excl_{_se['id']}", help="Delete this list"):
+                delete_exclusion_list(_se["id"])
+                st.rerun()
+
+_ec_name_col, _ec_save_col = st.columns([4, 1])
+with _ec_name_col:
+    _excl_save_name = st.text_input(
+        "Save exclusion list as",
+        placeholder="e.g. Standard Ontario auto",
+        label_visibility="collapsed",
+        key="excl_save_name",
+    )
+with _ec_save_col:
+    if st.button("Save list", disabled=not _excl_save_name.strip()):
+        save_exclusion_list(_excl_save_name.strip(), excluded_types)
+        st.success(f'Saved "{_excl_save_name.strip()}"')
+        st.rerun()
 
 # Show setup only when R2 is not yet working (credentials missing)
 if not r2_configured:
@@ -532,7 +599,7 @@ if _past_sessions:
     _by_date: "OrderedDict[str, list]" = OrderedDict()
     for _sess in _past_sessions:
         try:
-            _d = _dt.fromisoformat(_sess["created_at"].replace("Z", "+00:00"))
+            _d = _dt.fromisoformat(_sess["created_at"].replace("Z", "+00:00")).astimezone(_ET)
             _date_key = f"{_d.strftime('%B')} {_d.day}, {_d.year}"
         except Exception:
             _date_key = _sess["created_at"][:10]
@@ -550,7 +617,7 @@ if _past_sessions:
                 _col_info.write(
                     f"**{session['claimant']}** — {session['filenames']} "
                     f"— {session['report_count']} report(s) "
-                    f"— {session['created_at'][11:16]} UTC"
+                    f"— {_dt.fromisoformat(session['created_at'].replace('Z', '+00:00')).astimezone(_ET).strftime('%H:%M')} ET"
                 )
 
                 session_summaries = []
@@ -639,7 +706,6 @@ if st.button("Process documents", disabled=not ready, type="primary"):
         return _on_skipped
 
     if r2_configured:
-        from src.r2_storage import download_as_bytes
         work_items = [
             (r2f["filename"], r2f["object_key"], r2f)
             for r2f in st.session_state["r2_files"]
@@ -655,7 +721,7 @@ if st.button("Process documents", disabled=not ready, type="primary"):
     status_box  = st.empty()
 
     for file_idx, (file_label, source_ref, r2f_meta) in enumerate(work_items):
-        progress_file = f".pipeline_progress_{file_idx}.json"
+        progress_file = f".pipeline_progress_{session_id}_{file_idx}.json"
         _file_skipped.clear()  # reset per-file skipped list
 
         try:
@@ -673,9 +739,10 @@ if st.button("Process documents", disabled=not ready, type="primary"):
 
             if r2_configured:
                 try:
+                    from src.r2_storage import download_as_bytes
                     client_r2 = _get_r2_client()
                     with st.spinner(f"Downloading {file_label} from R2…"):
-                        pdf_source = download_as_bytes(client_r2, _r2_bucket, source_ref)
+                        pdf_source = download_as_bytes(client_r2, _r2_bucket, str(source_ref))
                 except Exception as e:
                     st.error(f"Failed to download **{file_label}** from R2: {e}")
                     continue
@@ -688,7 +755,7 @@ if st.button("Process documents", disabled=not ready, type="primary"):
                 api_key=_api_key,
                 output_path=os.devnull,
                 progress_file=progress_file,
-                ocr_backend=ocr_backend,
+                ocr_backend=cast(OCRBackend, ocr_backend),
                 analysis_model=analysis_model,
                 claimant_name=claimant_name.strip(),
                 on_progress=make_progress_callback(file_idx, file_label, total_files),
@@ -806,3 +873,9 @@ if st.button("Process documents", disabled=not ready, type="primary"):
             file_name=f"{safe_name}_medical_summary.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
+
+if _app_password and st.session_state.get("authenticated"):
+    st.divider()
+    if st.button("Sign out", type="secondary"):
+        st.session_state["authenticated"] = False
+        st.rerun()

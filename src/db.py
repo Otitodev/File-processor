@@ -64,6 +64,13 @@ CREATE TABLE IF NOT EXISTS saved_prompts (
     created_at TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS saved_exclusions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL UNIQUE,
+    types      TEXT    NOT NULL,
+    created_at TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS app_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -276,6 +283,38 @@ def delete_prompt(prompt_id: int, db_path: str = DB_PATH) -> None:
     """Delete a saved prompt by its id."""
     with sqlite3.connect(db_path) as con:
         con.execute("DELETE FROM saved_prompts WHERE id = ?", (prompt_id,))
+
+
+# ---------------------------------------------------------------------------
+# Saved exclusion lists
+# ---------------------------------------------------------------------------
+
+
+def save_exclusion_list(name: str, types: List[str], db_path: str = DB_PATH) -> None:
+    """Insert or update a saved exclusion list by name (upsert)."""
+    created_at = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            "INSERT INTO saved_exclusions (name, types, created_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(name) DO UPDATE SET types = excluded.types",
+            (name, ",".join(types), created_at),
+        )
+
+
+def list_exclusion_lists(db_path: str = DB_PATH) -> List[dict]:
+    """Return all saved exclusion lists, oldest first. Each dict has: id, name, types, created_at."""
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT id, name, types, created_at FROM saved_exclusions ORDER BY id ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_exclusion_list(exc_id: int, db_path: str = DB_PATH) -> None:
+    """Delete a saved exclusion list by its id."""
+    with sqlite3.connect(db_path) as con:
+        con.execute("DELETE FROM saved_exclusions WHERE id = ?", (exc_id,))
 
 
 # ---------------------------------------------------------------------------
